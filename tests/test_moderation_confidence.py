@@ -7,6 +7,7 @@ from bot.config import ModerationConfig
 from bot.db.models import ModerationRule
 from bot.services.join_screening import screen_member_profile_verbose
 from bot.services.moderation import ModerationService
+from bot.services.moderation_input import build_moderation_input
 
 
 class _NoAutoflush:
@@ -407,6 +408,160 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(verdict.violated)
         self.assertTrue(verdict.conclusive)
+
+    async def test_semantic_review_keeps_content_past_old_1200_limit(self) -> None:
+        service = self._service('{"violated": false}')
+        payload = "正常内容" * 400 + "[button text] 尾部广告"
+
+        await service.evaluate(self.session, -100, payload)
+
+        self.assertIn("尾部广告", service.llm.moderation.await_args.args[1])
+
+    async def test_button_text_can_trigger_local_rule_without_llm(self) -> None:
+        self.rule.rule_type = "keyword"
+        self.rule.pattern = "广告按钮"
+        service = self._service('{"violated": false}')
+        message = SimpleNamespace(
+            text="正文正常",
+            reply_markup=SimpleNamespace(inline_keyboard=[[
+                SimpleNamespace(text="广告按钮", url="https://offer.example"),
+            ]]),
+        )
+
+        verdict = await service.evaluate(self.session, -100, build_moderation_input(message))
+
+        self.assertTrue(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+        service.llm.moderation.assert_not_awaited()
+
+    async def test_hidden_url_can_trigger_regex_without_llm(self) -> None:
+        self.rule.rule_type = "regex"
+        self.rule.pattern = r"https://hidden\.example/offer"
+        service = self._service('{"violated": false}')
+        message = SimpleNamespace(
+            text="点击查看",
+            entities=[SimpleNamespace(type="text_link", url="https://hidden.example/offer")],
+        )
+
+        verdict = await service.evaluate(self.session, -100, build_moderation_input(message))
+
+        self.assertTrue(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+        service.llm.moderation.assert_not_awaited()
+
+    async def test_reference_content_triggers_local_rules(self) -> None:
+        for rule_type, pattern, message in (
+            ("keyword", "引用广告", SimpleNamespace(quote=SimpleNamespace(text="引用广告"))),
+            ("regex", r"^https://reply\.example$", SimpleNamespace(reply_to_message=SimpleNamespace(
+                caption="说明", caption_entities=[SimpleNamespace(url="https://reply.example")],
+            ))),
+            ("keyword", "广告选项", SimpleNamespace(external_reply=SimpleNamespace(
+                poll=SimpleNamespace(options=[SimpleNamespace(text="广告选项")]),
+            ))),
+        ):
+            with self.subTest(pattern=pattern):
+                self.rule.rule_type = rule_type
+                self.rule.pattern = pattern
+                service = self._service('{"violated": false}')
+                verdict = await service.evaluate(self.session, -100, build_moderation_input(message))
+                self.assertTrue(verdict.violated)
+                service.llm.moderation.assert_not_awaited()
+
+    async def test_reference_source_labels_do_not_match_local_rule(self) -> None:
+        self.rule.rule_type = "keyword"
+        self.rule.pattern = "quote"
+        service = self._service('{"violated": false}')
+        message = SimpleNamespace(text="正常", quote=SimpleNamespace(text="天气"))
+        verdict = await service.evaluate(self.session, -100, build_moderation_input(message))
+        self.assertFalse(verdict.violated)
+
+    async def test_extractor_media_labels_do_not_match_local_keyword(self) -> None:
+        self.rule.rule_type = "keyword"
+        self.rule.pattern = "image"
+        service = self._service('{"violated": false}')
+        payload = build_moderation_input(
+            SimpleNamespace(caption="正常图片说明"),
+            text="[image]\n正常图片说明", msg_type="photo_caption",
+        )
+        verdict = await service.evaluate(self.session, -100, payload)
+        self.assertFalse(verdict.violated)
+
+    async def test_semantic_review_receives_attributed_references(self) -> None:
+        service = self._service('{"violated": false}')
+        message = SimpleNamespace(text="正文", quote=SimpleNamespace(text="引用内容"))
+        await service.evaluate(self.session, -100, build_moderation_input(message))
+        payload = service.llm.moderation.await_args.args[1]
+        self.assertIn("[current-message]", payload)
+        self.assertIn("[quote]", payload)
+        self.assertIn("引用内容", payload)
+
+    async def test_generated_keyboard_labels_cannot_trigger_local_keyword(self) -> None:
+        self.rule.rule_type = "keyword"
+        self.rule.pattern = "button"
+        service = self._service('{"violated": false}')
+        message = SimpleNamespace(
+            text="正常内容",
+            reply_markup=SimpleNamespace(inline_keyboard=[[SimpleNamespace(text="天气")]]),
+        )
+
+        verdict = await service.evaluate(self.session, -100, build_moderation_input(message))
+
+        self.assertFalse(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+
+    async def test_anchored_regex_checks_individual_keyboard_values(self) -> None:
+        self.rule.rule_type = "regex"
+        self.rule.pattern = r"^广告按钮$"
+        service = self._service('{"violated": false}')
+        message = SimpleNamespace(
+            text="正常内容",
+            reply_markup=SimpleNamespace(inline_keyboard=[[SimpleNamespace(text="广告按钮")]]),
+        )
+
+        verdict = await service.evaluate(self.session, -100, build_moderation_input(message))
+
+        self.assertTrue(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+
+    async def test_later_semantic_chunk_can_detect_advertisement(self) -> None:
+        service = self._service([
+            '{"violated": false}',
+            '{"violated": true, "rule_id": 7, "confidence": 0.99}',
+        ])
+        payload = "正常内容" * 1100 + "[button url] https://advert.example"
+
+        verdict = await service.evaluate(self.session, -100, payload)
+
+        self.assertTrue(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+        self.assertEqual(service.llm.moderation.await_count, 2)
+        self.assertIn("https://advert.example", service.llm.moderation.await_args.args[1])
+
+    async def test_uncertain_chunk_cannot_be_overwritten_by_clean_chunk(self) -> None:
+        service = self._service(["unparseable", '{"violated": false}'])
+
+        verdict = await service.evaluate(self.session, -100, "正常内容" * 1100)
+
+        self.assertFalse(verdict.violated)
+        self.assertFalse(verdict.conclusive)
+        self.assertEqual(service.llm.moderation.await_count, 2)
+
+    async def test_chunk_overlap_keeps_boundary_phrase(self) -> None:
+        service = self._service('{"violated": false}')
+        payload = "a" * 3995 + "BOUNDARY_ADVERTISEMENT" + "b" * 100
+
+        await service.evaluate(self.session, -100, payload)
+
+        self.assertIn("BOUNDARY_ADVERTISEMENT", service.llm.moderation.await_args.args[1])
+
+    async def test_semantic_safety_budget_overflow_is_not_a_clean_pass(self) -> None:
+        service = self._service('{"violated": false}')
+
+        verdict = await service.evaluate(self.session, -100, "正常" * 20000)
+
+        self.assertFalse(verdict.violated)
+        self.assertFalse(verdict.conclusive)
+        self.assertLessEqual(service.llm.moderation.await_count, 8)
 
 
 if __name__ == "__main__":

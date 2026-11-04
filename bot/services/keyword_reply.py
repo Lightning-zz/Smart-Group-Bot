@@ -12,6 +12,7 @@ import logging
 
 import regex
 
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +24,7 @@ from bot.services.message_templates import (
     render_markdown_html,
     render_plain_template,
 )
+from bot.utils.logging_setup import sanitize_log_text
 from bot.utils.telegram import (
     answer_with_auto_delete,
     configured_auto_delete_seconds,
@@ -50,11 +52,14 @@ def keyword_rule_matches(rule: KeywordReply, text: str) -> bool:
                 regex.search(keyword, subject, timeout=REGEX_MATCH_TIMEOUT_SECONDS)
                 is not None
             )
-        except (regex.error, TimeoutError):
+        except (regex.error, TimeoutError) as exc:
             log.warning(
-                "keyword regex skipped (invalid or too slow) | group=%s rule=%s",
+                "keyword regex skipped (invalid or too slow) | group=%s rule=%s "
+                "error_type=%s error=%s",
                 rule.group_id,
                 rule.id,
+                type(exc).__name__,
+                sanitize_log_text(exc)[:240],
             )
             return False
     return keyword.casefold() in subject.casefold()
@@ -116,11 +121,15 @@ async def send_keyword_reply(
             drop_invalid_reply_markup=True,
             disable_link_preview=disable_link_preview,
         )
-    except Exception:
-        log.exception(
-            "keyword reply send failed | group=%s rule=%s",
+    except Exception as exc:
+        log.warning(
+            "keyword reply send failed | group=%s rule=%s "
+            "error_type=%s error=%s",
             rule.group_id,
             rule.id,
+            type(exc).__name__,
+            sanitize_log_text(exc)[:240],
+            exc_info=not isinstance(exc, (TelegramAPIError, TimeoutError)),
         )
         return None if return_message else False
     if rule.pin_message and sent is not None:
@@ -130,10 +139,14 @@ async def send_keyword_reply(
                 message_id=sent.message_id,
                 disable_notification=True,
             )
-        except Exception:
+        except Exception as exc:
             log.warning(
-                "keyword reply pin failed | group=%s rule=%s",
+                "keyword reply pin failed | group=%s rule=%s "
+                "error_type=%s error=%s",
                 rule.group_id,
                 rule.id,
+                type(exc).__name__,
+                sanitize_log_text(exc)[:240],
+                exc_info=not isinstance(exc, (TelegramAPIError, TimeoutError)),
             )
     return sent if return_message else True

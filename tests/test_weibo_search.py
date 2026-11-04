@@ -19,6 +19,25 @@ class PlatformCommonJsonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("blocked", ctx.exception.body_preview)
         self.assertIn("invalid_json_response", str(ctx.exception))
 
+    async def test_invalid_json_warning_and_exception_hide_url_and_body(self) -> None:
+        url = "https://m.weibo.cn/private/path?query=PRIVATE_QUERY"
+        body = "<html>PRIVATE_RESPONSE_CONTENT</html>"
+        with (
+            patch(
+                "bot.services.skills.platform_common.fetch_text",
+                new=AsyncMock(return_value=(200, body, url, "text/html")),
+            ),
+            self.assertLogs("bot.services.skills.platform_common", level="WARNING") as captured,
+        ):
+            with self.assertRaises(InvalidJsonResponseError) as ctx:
+                await fetch_json(url)
+        self.assertEqual(ctx.exception.url, url)
+        self.assertEqual(ctx.exception.body_preview, body)
+        rendered = "\n".join(captured.output) + str(ctx.exception)
+        self.assertNotIn("PRIVATE_QUERY", rendered)
+        self.assertNotIn("PRIVATE_RESPONSE_CONTENT", rendered)
+        self.assertIn("response_chars=37", rendered)
+
 
 class WeiboSearchSkillTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

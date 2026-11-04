@@ -38,6 +38,7 @@ from bot.services.recent_messages import (
     consume_member_removal,
     record_group_message,
 )
+from bot.utils.logging_setup import sanitize_log_text
 from bot.utils.telegram import schedule_message_auto_delete_durable
 
 log = logging.getLogger(__name__)
@@ -56,23 +57,57 @@ class PendingVerificationGateMiddleware(BaseMiddleware):
         self.session_factory = session_factory
 
     @staticmethod
-    async def _delete_or_schedule(event: Message, chat_id: int) -> None:
+    async def _delete_or_schedule(event: Message, chat_id: int) -> str:
         """Delete a message, falling back to the durable deletion queue.
 
         A transient Telegram outage or permissions hiccup must not leave the
         residue behind; the durable queue retries once conditions recover.
         """
         try:
-            await event.delete()
-        except Exception:
-            try:
-                await schedule_message_auto_delete_durable(event, 1)
-            except Exception:
-                log.exception(
-                    "verification gate fallback delete failed | chat=%s message=%s",
+            deleted = await event.delete()
+            if deleted is not False:
+                return "deleted"
+            log.warning(
+                "verification gate delete returned false | chat=%s message=%s",
+                chat_id,
+                getattr(event, "message_id", 0),
+            )
+            return "failed"
+        except Exception as exc:
+            delete_error = exc
+        try:
+            queued = await schedule_message_auto_delete_durable(event, 1)
+            if queued:
+                log.warning(
+                    "verification gate delete deferred to durable queue | "
+                    "chat=%s message=%s error_type=%s error=%s",
                     chat_id,
                     getattr(event, "message_id", 0),
+                    type(delete_error).__name__,
+                    sanitize_log_text(delete_error)[:240],
                 )
+                return "queued"
+            log.warning(
+                "verification gate delete unavailable; durable fallback rejected | "
+                "chat=%s message=%s delete_error_type=%s delete_error=%s",
+                chat_id,
+                getattr(event, "message_id", 0),
+                type(delete_error).__name__,
+                sanitize_log_text(delete_error)[:240],
+            )
+            return "failed"
+        except Exception as exc:
+            log.warning(
+                "verification gate delete and fallback failed | chat=%s message=%s "
+                "delete_error_type=%s fallback_error_type=%s fallback_error=%s",
+                chat_id,
+                getattr(event, "message_id", 0),
+                type(delete_error).__name__,
+                type(exc).__name__,
+                sanitize_log_text(exc)[:240],
+                exc_info=True,
+            )
+            return "failed"
 
     async def __call__(
         self,
@@ -112,7 +147,15 @@ class PendingVerificationGateMiddleware(BaseMiddleware):
                     chat.id,
                     left_id,
                 )
-                await self._delete_or_schedule(event, chat.id)
+                outcome = await self._delete_or_schedule(event, chat.id)
+                log.info(
+                    "[%s] removal service message cleanup outcome=%s | "
+                    "member=%s message=%s",
+                    chat.id,
+                    outcome,
+                    left_id,
+                    service_message_id,
+                )
                 return None
 
         if (
@@ -151,10 +194,12 @@ class PendingVerificationGateMiddleware(BaseMiddleware):
             )
             return await handler(event, data)
 
+        outcome = await self._delete_or_schedule(event, chat.id)
         log.info(
-            "[%s] deleted message from unverified member %s",
+            "[%s] unverified member message cleanup outcome=%s | user=%s message=%s",
             chat.id,
+            outcome,
             user.id,
+            getattr(event, "message_id", 0),
         )
-        await self._delete_or_schedule(event, chat.id)
         return None

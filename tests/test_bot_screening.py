@@ -305,6 +305,30 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         message.delete.assert_not_awaited()
         message._test_reset.assert_not_awaited()
 
+    async def test_guest_bot_reply_advertising_is_not_exempted_from_review(self) -> None:
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=ModerationVerdict(
+                violated=False, reason="", rule=None, conclusive=True, confidence=0.9,
+            )),
+        )
+        message = _bot_message()
+        message.reply_to_message = SimpleNamespace(
+            text="被回复的广告", entities=[SimpleNamespace(
+                type="text_link", url="https://reply-ad.example",
+            )],
+        )
+        message.quote = SimpleNamespace(text="选中的广告内容")
+
+        await self._run(message=message, moderation_service=moderation)
+
+        submitted = moderation.evaluate.await_args.args[2]
+        for evidence in ("被回复的广告", "https://reply-ad.example", "选中的广告内容"):
+            self.assertIn(evidence, submitted)
+            self.assertIn(evidence, "\n".join(submitted.deterministic_parts))
+        self.assertIn("[reply-to-message]", submitted)
+        self.assertIn("[quote]", submitted)
+
     async def test_deauthorization_during_bot_verdict_suppresses_all_actions(self) -> None:
         rule = SimpleNamespace(id=5, action="ban", rule_type="llm", pattern="禁止广告")
         verdict = ModerationVerdict(
@@ -574,12 +598,51 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
                     evaluate=AsyncMock(),
                 )
 
+                message = _bot_message()
+                message.text = None
+                message.caption = None
                 message = await self._run(
-                    moderation_service=moderation, msg_type=placeholder_type
+                    message=message, moderation_service=moderation, msg_type=placeholder_type
                 )
 
                 moderation.evaluate.assert_not_awaited()
                 message._test_record_pass.assert_not_awaited()
+
+    async def test_media_with_advertising_keyboard_is_screened(self) -> None:
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=ModerationVerdict(
+                violated=False, reason="", rule=None, conclusive=False,
+            )),
+        )
+        message = _bot_message()
+        message.reply_markup = SimpleNamespace(inline_keyboard=[[
+            SimpleNamespace(text="广告按钮", url="https://offer.example"),
+        ]])
+
+        await self._run(message=message, moderation_service=moderation, msg_type="video")
+
+        moderation.evaluate.assert_awaited_once()
+        submitted = moderation.evaluate.await_args.args[2]
+        self.assertIn("广告按钮", submitted)
+        self.assertIn("https://offer.example", submitted)
+        message._test_record_pass.assert_not_awaited()
+
+    async def test_hidden_link_is_in_bot_review_without_changing_body(self) -> None:
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=ModerationVerdict(
+                violated=False, reason="", rule=None, conclusive=False,
+            )),
+        )
+        message = _bot_message()
+        message.entities = [SimpleNamespace(type="text_link", url="https://hidden.example")]
+
+        await self._run(message=message, moderation_service=moderation)
+
+        submitted = moderation.evaluate.await_args.args[2]
+        self.assertTrue(submitted.startswith("spam text"))
+        self.assertIn("https://hidden.example", submitted)
 
     async def test_media_with_vision_text_is_screened(self) -> None:
         verdict = ModerationVerdict(

@@ -13,6 +13,7 @@ from bot.db.engine import init_db
 from bot.handlers import admin, commands, group, membership
 from bot.loader import create_bot, dp
 from bot.middlewares.db import DbSessionMiddleware
+from bot.middlewares.command_moderation import CommandModerationMiddleware
 from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
 from bot.middlewares.logging_mw import LoggingMiddleware
 from bot.middlewares.member_roster import MemberRosterMiddleware
@@ -325,9 +326,22 @@ async def _initialize_runtime_services(
     return runtime_config, llm, memory
 
 
+def _register_command_moderation_middlewares(session_factory: Any) -> None:
+    # Parent dispatcher DB middleware wraps these child-router inner
+    # middlewares; unmatched commands never run the moderation pass twice.
+    for router in (commands.router, admin.router):
+        for middleware in tuple(router.message.middleware):
+            if isinstance(middleware, CommandModerationMiddleware):
+                router.message.middleware.unregister(middleware)
+        router.message.middleware(CommandModerationMiddleware(session_factory))
+
+
 def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     """Install middleware on every update observer that needs its services."""
 
+    # Establish correlation before deduplication and every authorization gate,
+    # without changing their relative execution order or return semantics.
+    dispatcher.update.outer_middleware(LoggingMiddleware())
     dispatcher.update.outer_middleware(
         DurableInboxUpdateDedupMiddleware(session_factory)
     )
@@ -341,7 +355,6 @@ def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     )
     # Roster tracking feeds the profile patrol; outer so every sender is seen.
     dispatcher.message.outer_middleware(MemberRosterMiddleware(session_factory))
-    dispatcher.message.middleware(LoggingMiddleware())
     # No throttle middleware: it silently drops rapid consecutive messages,
     # which breaks inbound batch merging and lets a fast second violating
     # message skip moderation. Burst smoothing is handled by the pending-reply
@@ -349,6 +362,13 @@ def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     dispatcher.message.middleware(DbSessionMiddleware(session_factory))
     # edited_message is a separate aiogram observer; message middleware is not
     # inherited by edit handlers that also require a database session.
+    # Apply the same security gates before an edited message reaches moderation.
+    dispatcher.edited_message.outer_middleware(
+        GlobalBanEnforcementMiddleware(session_factory)
+    )
+    dispatcher.edited_message.outer_middleware(
+        PendingVerificationGateMiddleware(session_factory)
+    )
     dispatcher.edited_message.middleware(DbSessionMiddleware(session_factory))
     dispatcher.callback_query.middleware(DbSessionMiddleware(session_factory))
     dispatcher.chat_member.middleware(DbSessionMiddleware(session_factory))
@@ -380,6 +400,7 @@ async def main() -> None:
         log.info("Preloaded %d delegated privileged operator scope(s)", warmed_operators)
 
     _register_update_middlewares(dp, session_factory)
+    _register_command_moderation_middlewares(session_factory)
 
     dp.include_router(commands.router)
     dp.include_router(admin.router)

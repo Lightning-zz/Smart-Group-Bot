@@ -770,7 +770,8 @@ class DoubaoTTSService:
                             resp.charset or "utf-8",
                             errors="ignore",
                         ).strip()
-                        log.warning("doubao tts http error status=%s body=%s", resp.status, body[:200])
+                        log.warning("doubao tts http error | status=%s body_chars=%d", resp.status, len(body))
+                        log.debug("doubao tts http error preview | body=%s", body[:200])
                         return TTSSynthesisResult(
                             ok=False,
                             text=normalized,

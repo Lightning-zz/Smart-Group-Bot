@@ -22,6 +22,105 @@ from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
 log = logging.getLogger(__name__)
 
+_SEMANTIC_CHUNK_SIZE = 4000
+_SEMANTIC_CHUNK_OVERLAP = 256
+_SEMANTIC_MAX_CHUNKS = 8
+_SEMANTIC_CONTEXT_SIZE = 8000
+
+
+class _SemanticChunk(str):
+    """Whether a reference chunk retained the current sender's full context."""
+
+    def __new__(cls, text: str, *, context_complete: bool = True):
+        value = super().__new__(cls, text)
+        value.context_complete = context_complete
+        return value
+
+
+def _attributed_semantic_chunks(
+    sections: tuple[tuple[str, str], ...],
+) -> tuple[list[str], bool]:
+    """Keep attribution and bounded full context on every evidence segment.
+
+    Flattening a long reply can leave a later chunk with only the original ad,
+    incorrectly presented as the current sender's own words. Repeat provenance
+    and bounded current-message/reference context instead. Current-content
+    segments also need their references to interpret reports or criticism.
+    A truncated context is still
+    reviewed, but cannot justify a direct high-confidence penalty or clean cache.
+    """
+    normalized = [
+        (source, clean_text(content, max_len=max(1, len(content))))
+        for source, content in sections
+    ]
+    current = next((content for source, content in normalized if source == "current-message"), "")
+    current_complete = len(current) <= _SEMANTIC_CONTEXT_SIZE
+    context = current[:_SEMANTIC_CONTEXT_SIZE]
+    references = "\n".join(
+        f"[{source}]\n{content}" for source, content in normalized
+        if source != "current-message" and content
+    )
+    references_complete = len(references) <= _SEMANTIC_CONTEXT_SIZE
+    reference_context = references[:_SEMANTIC_CONTEXT_SIZE]
+    context_complete = current_complete and references_complete
+    chunks: list[str] = []
+    for source, content in normalized:
+        if not content:
+            continue
+        prefix = ""
+        if current:
+            prefix = f"[current-message]\n{context}\n"
+        else:
+            prefix = "[current-message has no textual content]\n"
+        if not current_complete:
+            prefix += "[current-message context incomplete]\n"
+        if reference_context:
+            prefix += f"[reference context]\n{reference_context}\n"
+        if not references_complete:
+            prefix += "[reference context incomplete]\n"
+        prefix += f"[{source}]\n"
+        start = 0
+        while start < len(content):
+            if len(chunks) >= _SEMANTIC_MAX_CHUNKS:
+                return chunks, False
+            end = min(len(content), start + _SEMANTIC_CHUNK_SIZE)
+            chunks.append(_SemanticChunk(
+                prefix + content[start:end],
+                context_complete=context_complete,
+            ))
+            if end == len(content):
+                break
+            start = end - _SEMANTIC_CHUNK_OVERLAP
+    return chunks or [""], context_complete
+
+
+def _semantic_chunks(text: str) -> tuple[list[str], bool]:
+    """Bound provider work without ever treating unseen content as clean.
+
+    Overlap preserves ordinary phrases/URLs crossing a chunk boundary.  A
+    safety-budget overflow is explicitly inconclusive, so it cannot earn a bot
+    whitelist pass or a profile-screening cache entry.
+    """
+    normalized = clean_text(text, max_len=max(1, len(text)))
+    if not normalized:
+        return [""], True
+    sections = getattr(text, "semantic_sections", ())
+    if (
+        len(normalized) > _SEMANTIC_CHUNK_SIZE
+        and sections
+        and any(source != "current-message" for source, _ in sections)
+    ):
+        return _attributed_semantic_chunks(sections)
+    chunks: list[str] = []
+    start = 0
+    while start < len(normalized) and len(chunks) < _SEMANTIC_MAX_CHUNKS:
+        end = min(len(normalized), start + _SEMANTIC_CHUNK_SIZE)
+        chunks.append(normalized[start:end])
+        if end == len(normalized):
+            return chunks, True
+        start = end - _SEMANTIC_CHUNK_OVERLAP
+    return chunks, False
+
 
 # Telegram represents a command addressed to a bot as
 # ``/command@bot_username``.  Moderation rules are configured against the
@@ -290,8 +389,19 @@ class ModerationService:
 
         deterministic_inconclusive = False
         llm_rules: list[ModerationRule] = []
-        normalized_text = text or ""
-        match_candidates = _moderation_match_candidates(normalized_text)
+        evidence_parts = getattr(text, "deterministic_parts", None)
+        if evidence_parts is None:
+            match_candidates = _moderation_match_candidates(text or "")
+        else:
+            # Exact/anchored rules apply to real field values, not generated
+            # section labels. Also retain the combined view for cross-field
+            # rules, and command aliases for the original body.
+            values = ("\n".join(evidence_parts), *evidence_parts)
+            match_candidates = tuple(dict.fromkeys(
+                candidate
+                for value in values
+                for candidate in _moderation_match_candidates(value)
+            ))
         folded_candidates = tuple(
             candidate.casefold() for candidate in match_candidates
         )
@@ -393,87 +503,106 @@ class ModerationService:
         system_prompt = build_defended_system(
             get_prompt("moderation").format(rules_json=rules_json)
         )
-        user_input = wrap_untrusted("待审核消息", clean_text(text, max_len=1200), max_len=1200)
-        try:
-            llm_raw = await self.llm.moderation(system_prompt, user_input)
-        except Exception:
-            log.exception("审核模型调用失败；本地规则已完成检查")
-            return make_verdict(
-                violated=False,
-                reason="",
-                rule=None,
-                conclusive=False,
-            )
-        data = _parse_moderation_json(llm_raw)
-
-        if not data:
-            raw_text = llm_raw or ""
-            escaped = raw_text.replace("\r", "\\r").replace("\n", "\\n")
-            preview_limit = 500
-            preview_truncated = len(escaped) > preview_limit
-            preview = escaped[:preview_limit]
+        chunks, fully_covered = _semantic_chunks(text or "")
+        semantic_inconclusive = not fully_covered
+        inconclusive_violation: ModerationVerdict | None = None
+        if not fully_covered:
             log.warning(
-                "审核模型输出不可解析，按不违规处理: response_len=%d preview_truncated=%s preview=%s",
-                len(raw_text),
-                preview_truncated,
-                preview,
+                "审核内容或归属上下文超过语义检查预算；未完整检查，结果不能记为通过 | "
+                "group=%s length=%d chunks=%d",
+                group_id, len(text or ""), len(chunks),
             )
-            return make_verdict(violated=False, reason="", rule=None, conclusive=False)
-
-        violated_value = data.get("violated", data.get("violation"))
-        if not isinstance(violated_value, bool):
-            log.warning("审核模型 violated 字段无效，按不违规处理")
-            return make_verdict(
-                violated=False,
-                reason="",
-                rule=None,
-                conclusive=False,
-            )
-        violated = violated_value
-        reason = clean_text(str(data.get("reason", "")).strip(), max_len=120)
-        confidence, confidence_valid = _parse_confidence(data.get("confidence"))
-
-        hit_rule: ModerationRule | None = None
-        rid = data.get("rule_id")
-        if rid is not None:
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            # Unlike the old 1200-character head slice, every accepted chunk
+            # is sent in full, including buttons/hidden links after the body.
+            user_input = wrap_untrusted("待审核消息", chunk, max_len=max(1, len(chunk)))
             try:
-                rid_int = int(rid)
-                hit_rule = next((r for r in llm_rules if r.id == rid_int), None)
-            except (TypeError, ValueError):
-                hit_rule = None
-
-        if violated and not hit_rule:
-            rule_text = str(data.get("rule", "")).strip()
-            if rule_text:
-                hit_rule = next(
-                    (r for r in llm_rules if (r.pattern or "").strip() == rule_text),
-                    None,
+                llm_raw = await self.llm.moderation(system_prompt, user_input)
+            except Exception:
+                log.exception(
+                    "审核模型调用失败；本段结果不确定 | group=%s chunk=%d/%d",
+                    group_id, chunk_index, len(chunks),
                 )
+                semantic_inconclusive = True
+                continue
+            data = _parse_moderation_json(llm_raw)
 
-        if violated:
-            if not reason:
-                reason = "命中群规（AI判定）"
-            log.info(
-                "审核命中: group=%s rule_id=%s confidence=%.2f reason=%s",
-                group_id,
-                hit_rule.id if hit_rule else None,
-                confidence,
-                reason,
-            )
-            return make_verdict(
+            if not data:
+                raw_text = llm_raw or ""
+                log.warning(
+                    "审核模型输出不可解析；本段结果不确定 | "
+                    "group=%s chunk=%d/%d response_len=%d",
+                    group_id, chunk_index, len(chunks), len(raw_text),
+                )
+                if log.isEnabledFor(logging.DEBUG):
+                    escaped = raw_text.replace("\r", "\\r").replace("\n", "\\n")
+                    log.debug(
+                        "审核模型输出预览 | group=%s chunk=%d/%d preview_truncated=%s preview=%s",
+                        group_id, chunk_index, len(chunks), len(escaped) > 500, escaped[:500],
+                    )
+                semantic_inconclusive = True
+                continue
+
+            violated_value = data.get("violated", data.get("violation"))
+            if not isinstance(violated_value, bool):
+                log.warning(
+                    "审核模型 violated 字段无效；本段结果不确定 | group=%s chunk=%d/%d",
+                    group_id, chunk_index, len(chunks),
+                )
+                semantic_inconclusive = True
+                continue
+            if not violated_value:
+                continue
+
+            reason = clean_text(str(data.get("reason", "")).strip(), max_len=120)
+            confidence, confidence_valid = _parse_confidence(data.get("confidence"))
+            hit_rule: ModerationRule | None = None
+            rid = data.get("rule_id")
+            if rid is not None:
+                try:
+                    rid_int = int(rid)
+                    hit_rule = next((r for r in llm_rules if r.id == rid_int), None)
+                except (TypeError, ValueError):
+                    hit_rule = None
+            if not hit_rule:
+                rule_text = str(data.get("rule", "")).strip()
+                if rule_text:
+                    hit_rule = next(
+                        (r for r in llm_rules if (r.pattern or "").strip() == rule_text),
+                        None,
+                    )
+            reason = reason or "命中群规（AI判定）"
+            verdict = make_verdict(
                 violated=True,
                 reason=reason,
                 rule=hit_rule,
-                conclusive=confidence_valid,
+                conclusive=confidence_valid and getattr(chunk, "context_complete", True),
                 confidence=confidence,
             )
+            if not verdict.conclusive:
+                semantic_inconclusive = True
+                inconclusive_violation = verdict
+                continue
+            log.info(
+                "审核命中: group=%s rule_id=%s confidence=%.2f chunk=%d/%d",
+                group_id, hit_rule.id if hit_rule else None, confidence,
+                chunk_index, len(chunks),
+            )
+            log.debug("审核命中说明 | group=%s reason=%s", group_id, reason)
+            return verdict
 
-        log.info("审核通过 (检查了 %d 条语义规则, AI判定)", len(llm_rules))
+        if inconclusive_violation is not None:
+            return inconclusive_violation
+        conclusive = not (deterministic_inconclusive or semantic_inconclusive)
+        log.info(
+            "审核%s (检查了 %d 条语义规则, %d 段) | group=%s",
+            "通过" if conclusive else "结果不确定", len(llm_rules), len(chunks), group_id,
+        )
         return make_verdict(
             violated=False,
             reason="",
             rule=None,
-            conclusive=not deterministic_inconclusive,
+            conclusive=conclusive,
         )
 
     def is_high_confidence(self, verdict: ModerationVerdict) -> bool:
@@ -530,6 +659,15 @@ class ModerationService:
         )
         if v is None:
             raise RuntimeError("failed to persist or reload idempotent violation event")
+        if not created and v.action_taken == "warn" and values["action_taken"] == "delete":
+            # Editing a previously warned message may require deletion now.
+            # Reuse the event, but publish the upgraded outcome once. Exact
+            # replay sees 'delete' and keeps its notification marker. Never
+            # overwrite direct/reverted administrative states or ban journals.
+            v.action_taken = "delete"
+            v.message_text = values["message_text"]
+            v.rule_id = values["rule_id"]
+            v.notice_sent_at = None
         setattr(v, "_source_event_created", created)
         return v
 

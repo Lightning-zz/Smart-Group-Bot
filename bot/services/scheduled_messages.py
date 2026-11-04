@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -31,6 +32,7 @@ from bot.services.message_templates import (
 )
 from bot.services.authz import list_authorized_groups
 from bot.services.patrol import parse_schedule_time
+from bot.utils.logging_setup import sanitize_log_text
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -500,11 +502,15 @@ class ScheduledMessageService:
                 reply_markup=keyboard,
                 disable_link_preview=disable_link_preview,
             )
-        except Exception:
-            log.exception(
-                "scheduled message send failed | group=%s entry=%s",
+        except Exception as exc:
+            log.warning(
+                "scheduled message send failed | group=%s entry=%s "
+                "error_type=%s error=%s",
                 group_id,
                 entry.id,
+                type(exc).__name__,
+                sanitize_log_text(exc)[:240],
+                exc_info=not isinstance(exc, (TelegramAPIError, TimeoutError)),
             )
             return False
         if entry.auto_delete:
@@ -512,17 +518,18 @@ class ScheduledMessageService:
                 sent,
                 configured_auto_delete_seconds(self.settings, "scheduled"),
             )
+        pinned = False
         if entry.pin_message:
-            await self._pin(entry, sent.message_id)
+            pinned = await self._pin(entry, sent.message_id)
         log.info(
             "scheduled message sent | group=%s entry=%s pinned=%s",
             group_id,
             entry.id,
-            bool(entry.pin_message),
+            pinned,
         )
         return True
 
-    async def _pin(self, entry: ScheduledMessage, message_id: int) -> None:
+    async def _pin(self, entry: ScheduledMessage, message_id: int) -> bool:
         group_id = int(entry.group_id)
         previous_id = int(entry.last_message_id or 0)
         if entry.unpin_previous and previous_id:
@@ -530,25 +537,41 @@ class ScheduledMessageService:
                 await self.bot.unpin_chat_message(
                     chat_id=group_id, message_id=previous_id
                 )
-            except Exception:
-                log.debug(
-                    "scheduled message unpin skipped | group=%s message=%s",
+            except Exception as exc:
+                log.warning(
+                    "scheduled message unpin failed; continuing with new pin | "
+                    "group=%s message=%s error_type=%s error=%s",
                     group_id,
                     previous_id,
+                    type(exc).__name__,
+                    sanitize_log_text(exc)[:240],
+                    exc_info=not isinstance(exc, (TelegramAPIError, TimeoutError)),
                 )
         try:
-            await self.bot.pin_chat_message(
+            pinned = await self.bot.pin_chat_message(
                 chat_id=group_id,
                 message_id=message_id,
                 disable_notification=True,
             )
-        except Exception:
+            if pinned is False:
+                log.warning(
+                    "scheduled message pin returned false | group=%s entry=%s message=%s",
+                    group_id,
+                    entry.id,
+                    message_id,
+                )
+                return False
+        except Exception as exc:
             log.warning(
-                "scheduled message pin failed | group=%s entry=%s",
+                "scheduled message pin failed | group=%s entry=%s "
+                "error_type=%s error=%s",
                 group_id,
                 entry.id,
+                type(exc).__name__,
+                sanitize_log_text(exc)[:240],
+                exc_info=not isinstance(exc, (TelegramAPIError, TimeoutError)),
             )
-            return
+            return False
         try:
             async with self.session_factory() as session:
                 row = await session.get(ScheduledMessage, int(entry.id))
@@ -563,3 +586,4 @@ class ScheduledMessageService:
                 group_id,
                 entry.id,
             )
+        return True

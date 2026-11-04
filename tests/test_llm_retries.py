@@ -806,6 +806,22 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(request_calls)
         self.assertEqual(request_calls[0].args[3], "/v1/messages")
 
+    async def test_generate_info_logs_only_response_metadata(self) -> None:
+        llm = self._make_llm()
+        private_response = "PRIVATE_RESPONSE_CONTENT"
+        with (
+            patch("bot.services.llm.litellm.acompletion", AsyncMock(return_value=_chat_resp(content=private_response))),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+            self.assertLogs("bot.services.llm", level="INFO") as captured,
+        ):
+            result = await llm.generate("sys", "hi")
+        self.assertEqual(result, private_response)
+        rendered = "\n".join(captured.output)
+        self.assertIn("LLM response", rendered)
+        self.assertIn("len=24", rendered)
+        self.assertNotIn(private_response, rendered)
+
     async def test_complete_with_tools_uses_responses_api_for_openai_compatible_when_enabled(self) -> None:
         llm = self._make_llm()
         llm.main.provider = "openai_compatible"

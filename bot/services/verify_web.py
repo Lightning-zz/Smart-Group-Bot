@@ -110,6 +110,7 @@ from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
 )
+from bot.utils.logging_setup import sanitize_log_text
 from bot.utils.timezone import now_shanghai_naive
 from bot.web.auth import (
     MAX_INIT_DATA_AGE_SECONDS,
@@ -2428,7 +2429,15 @@ class _WebhookUpdateQueue:
                     f"update processing exceeded "
                     f"{self._update_timeout_seconds(queued):.1f}s"
                 )
-            log.exception("Telegram webhook update processing timed out")
+            log.warning(
+                "Telegram webhook update processing timed out | update=%s "
+                "phase=%s priority=%s error_type=%s error=%s",
+                queued.update_id,
+                phase,
+                int(queued.priority),
+                type(exc).__name__,
+                sanitize_log_text(exc)[:240],
+            )
             if late_handoff:
                 assert exc.unfinished_task is not None
                 late = asyncio.create_task(
@@ -2469,7 +2478,14 @@ class _WebhookUpdateQueue:
                     "update processing failed "
                     f"{self._consecutive_failures} consecutive times: {exc}"
                 )
-            log.exception("Telegram webhook update processing failed")
+            log.exception(
+                "Telegram webhook update processing failed | update=%s "
+                "phase=%s priority=%s error_type=%s",
+                queued.update_id,
+                phase,
+                int(queued.priority),
+                type(exc).__name__,
+            )
             return False
         else:
             if not (self._durable_inbox_enabled and receipt.deferred):
@@ -2490,10 +2506,13 @@ class _WebhookUpdateQueue:
                         queued,
                         error=terminal_error,
                     )
-                except Exception:
+                except Exception as exc:
                     log.exception(
-                        "failed to release durable webhook update | update=%s",
+                        "failed to release durable webhook update | update=%s "
+                        "phase=%s error_type=%s",
                         queued.update_id,
+                        phase,
+                        type(exc).__name__,
                     )
 
     async def _worker(

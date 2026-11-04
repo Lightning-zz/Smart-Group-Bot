@@ -11,6 +11,7 @@ from bot.services.doubao_tts import TTSDeliveryResult
 from bot.services.skills.base import SkillAnswerResult
 from bot.services.update_completion import UpdateCompletionReceipt
 from bot.utils.telegram import ReplyMessageOverlay, TelegramDeliveryResult
+from bot.utils.logging_setup import get_log_context, reset_log_context, set_log_context
 
 
 def _settings(delay: float = 5.0) -> SimpleNamespace:
@@ -48,6 +49,19 @@ def _item(
 
 
 class PendingReplyDebounceTests(unittest.TestCase):
+    def test_pending_batch_log_context_is_explicit_and_compacts_ids(self) -> None:
+        first = _item("first", message=SimpleNamespace(message_id=11))
+        second = _item("second", message=SimpleNamespace(message_id=12))
+        first.log_context = {"update_id": 901}
+        second.log_context = {"update_id": 902}
+        context = group._pending_batch_log_context((-10001, 123), [first, second])
+        self.assertEqual(context["req_id"], "batch:-10001:123:11")
+        self.assertEqual(context["flow_id"], "batch--10001-123-11")
+        self.assertEqual(context["update_id"], "901,902")
+        self.assertEqual(context["message_id"], "11,12")
+        self.assertEqual(context["chat_id"], -10001)
+        self.assertEqual(context["user_id"], 123)
+
     def test_question_message_flushes_well_before_config_ceiling(self) -> None:
         due_at = group._next_pending_reply_flush_at(
             item=_item("ios 上最好用的是啥啊"),
@@ -684,6 +698,39 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
                     state.task.cancel()
             group._PENDING_REPLY_BATCHES.clear()
         group._PENDING_REPLY_ORPHAN_STARTED.clear()
+
+    async def test_reused_worker_uses_each_batch_sources_not_first_update(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        contexts: list[dict[str, object]] = []
+        workers: list[object] = []
+
+        async def process(*_args: object, **_kwargs: object) -> group._PendingReplyOutcome:
+            contexts.append(get_log_context())
+            workers.append(asyncio.current_task())
+            if len(contexts) == 1:
+                started.set()
+                await release.wait()
+            return group._PendingReplyOutcome(succeeded=True)
+
+        with patch("bot.handlers.group._process_pending_reply_batch_guarded", new=process):
+            for update_id, message_id in ((901, 11), (902, 12), (903, 13)):
+                tokens = set_log_context(update_id=update_id, chat_id=-10001, user_id=123)
+                try:
+                    item = _item("private-text", message=SimpleNamespace(message_id=message_id))
+                    await group._enqueue_pending_reply(item, _settings(0.0))
+                finally:
+                    reset_log_context(tokens)
+                if update_id == 901:
+                    await asyncio.wait_for(started.wait(), timeout=1.0)
+            release.set()
+            await group.flush_pending_inbound_batches()
+
+        self.assertEqual([context["update_id"] for context in contexts], ["901", "902,903"])
+        self.assertEqual([context["message_id"] for context in contexts], ["11", "12,13"])
+        self.assertIs(workers[0], workers[1])
+        self.assertNotEqual(contexts[0]["flow_id"], contexts[1]["flow_id"])
+        self.assertTrue(all(value == "-" for value in get_log_context().values()))
 
     async def asyncTearDown(self) -> None:
         async with group._PENDING_REPLY_LOCK:

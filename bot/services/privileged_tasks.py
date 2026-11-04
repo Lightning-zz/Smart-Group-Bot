@@ -34,6 +34,7 @@ from bot.services.update_completion import (
     UpdateCompletionReceipt,
     current_update_completion,
 )
+from bot.utils.logging_setup import get_log_context, reset_log_context, set_log_context
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ class _PrivilegedJob:
     completion: asyncio.Future[bool]
     receipts: list[UpdateCompletionReceipt] = field(default_factory=list)
     orphaned: bool = False
+    log_context: dict[str, Any] = field(default_factory=get_log_context)
 
 
 @dataclass(slots=True)
@@ -109,6 +111,19 @@ class _RunnerState:
 _RUNNER_STATES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _RunnerState]" = (
     weakref.WeakKeyDictionary()
 )
+
+
+def _job_log_context(job: _PrivilegedJob) -> dict[str, Any]:
+    # Transfer diagnostic IDs only. The worker's empty Context must continue
+    # isolating authorization priority and durable-completion ownership.
+    return {
+        "req_id": f"job:{job.job_id}",
+        "flow_id": f"privileged-{job.job_id}",
+        "update_id": job.log_context.get("update_id", "-"),
+        "chat_id": job.log_context.get("chat_id", "-"),
+        "user_id": job.log_context.get("user_id", "-"),
+        "message_id": job.log_context.get("message_id", "-"),
+    }
 
 
 def _runner_state() -> _RunnerState:
@@ -194,14 +209,18 @@ def _expire_queued_jobs(state: _RunnerState) -> int:
             if deadline_at <= now:
                 expired += 1
                 _finish_queued_job(state, job, succeeded=False)
-                log.error(
-                    "expired queued privileged task discarded | "
-                    "job=%s label=%s lane=%s age=%.3fs",
-                    job.job_id,
-                    job.label,
-                    lane_name,
-                    max(0.0, now - job.enqueued_at),
-                )
+                log_tokens = set_log_context(**_job_log_context(job))
+                try:
+                    log.error(
+                        "expired queued privileged task discarded | "
+                        "job=%s label=%s lane=%s age=%.3fs",
+                        job.job_id,
+                        job.label,
+                        lane_name,
+                        max(0.0, now - job.enqueued_at),
+                    )
+                finally:
+                    reset_log_context(log_tokens)
             else:
                 retained.append(item)
         for item in retained:
@@ -359,6 +378,7 @@ async def _worker(state: _RunnerState, lane_name: PrivilegedLane) -> None:
     while True:
         _priority, _sequence, job = await lane.queue.get()
         succeeded = False
+        log_tokens = set_log_context(**_job_log_context(job))
         try:
             succeeded = await _run_job_bounded(job, state)
             if job.orphaned:
@@ -382,15 +402,18 @@ async def _worker(state: _RunnerState, lane_name: PrivilegedLane) -> None:
             # the database. Keep its dedup key and durable receipts owned until
             # the actual child task reaches a terminal state; replaying sooner
             # would execute the same permission change concurrently.
-            if not job.orphaned:
-                if not job.completion.done():
-                    job.completion.set_result(succeeded)
-                for receipt in job.receipts:
-                    receipt.finish(succeeded)
-                job.receipts.clear()
-                if state.jobs_by_key.get(job.key) is job:
-                    state.jobs_by_key.pop(job.key, None)
-            lane.queue.task_done()
+            try:
+                if not job.orphaned:
+                    if not job.completion.done():
+                        job.completion.set_result(succeeded)
+                    for receipt in job.receipts:
+                        receipt.finish(succeeded)
+                    job.receipts.clear()
+                    if state.jobs_by_key.get(job.key) is job:
+                        state.jobs_by_key.pop(job.key, None)
+            finally:
+                reset_log_context(log_tokens)
+                lane.queue.task_done()
 
 
 def _ensure_workers(state: _RunnerState, lane_name: PrivilegedLane) -> None:

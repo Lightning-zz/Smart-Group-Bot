@@ -83,8 +83,7 @@ class InvalidJsonResponseError(ValueError):
         message = (
             f"invalid_json_response status={self.status} "
             f"content_type={self.content_type or '-'} "
-            f"url={self.url or '-'} "
-            f"preview={self.body_preview or '(empty)'}"
+            f"response_preview_chars={len(self.body_preview)}"
         )
         super().__init__(message)
 
@@ -694,12 +693,12 @@ async def fetch_json(
     except json.JSONDecodeError as exc:
         preview = clean_multiline_text((text or "").strip(), max_len=240)
         log.warning(
-            "fetch_json invalid json | status=%s content_type=%s url=%s preview=%s",
+            "fetch_json invalid json | status=%s content_type=%s response_chars=%d",
             status,
             content_type or "-",
-            final_url or url,
-            preview or "(empty)",
+            len(text or ""),
         )
+        log.debug("fetch_json invalid json preview | url=%s preview=%s", final_url or url, preview or "(empty)")
         raise InvalidJsonResponseError(
             url=final_url or url,
             status=status,
@@ -1212,7 +1211,7 @@ async def site_search(
         for region in (primary_region, fallback_region):
             remaining = deadline - loop.time()
             if remaining <= 0:
-                log.warning("site_search total timeout: query=%s", query)
+                log.warning("site_search total timeout | query_chars=%d", len(query))
                 return [], clean_text(query, max_len=220).strip()
             try:
                 rows = await run_search_thread(
@@ -1230,19 +1229,19 @@ async def site_search(
             except TimeoutError:
                 last_error = "search_timeout"
                 log.warning(
-                    "site_search timed out: idx=%d region=%s query=%s",
+                    "site_search timed out: idx=%d region=%s query_chars=%d",
                     idx,
                     region,
-                    candidate,
+                    len(candidate),
                 )
                 continue
             except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
                 log.warning(
-                    "site_search failed: idx=%d region=%s query=%s error=%s",
+                    "site_search failed: idx=%d region=%s query_chars=%d error=%s",
                     idx,
                     region,
-                    candidate,
+                    len(candidate),
                     exc,
                 )
                 continue
@@ -1252,5 +1251,5 @@ async def site_search(
                 return results, candidate
 
     if last_error:
-        log.warning("site_search exhausted without results: query=%s error=%s", query, last_error)
+        log.warning("site_search exhausted without results: query_chars=%d error=%s", len(query), last_error)
     return [], clean_text(query, max_len=220).strip()

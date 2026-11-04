@@ -156,6 +156,82 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             )
         return message
 
+    async def test_reply_evidence_reaches_semantic_review_with_source_labels(self) -> None:
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=ModerationVerdict(
+                violated=False, reason="", rule=None, conclusive=True,
+            )),
+        )
+        message = _message()
+        message.reply_to_message = SimpleNamespace(text="引用广告", from_user=None)
+        message.quote = SimpleNamespace(text="引用广告")
+
+        await self._run(
+            moderation,
+            message=message,
+            reply=patch(
+                "bot.handlers.group._build_reply_context_for_llm",
+                new=AsyncMock(return_value="[reply_to:text] 引用广告"),
+            ),
+        )
+
+        submitted = moderation.evaluate.await_args.args[2]
+        self.assertIn("ambiguous message", submitted)
+        self.assertIn("引用广告", submitted)
+        self.assertIn("[current-message]", submitted)
+        self.assertIn("[quote]", submitted)
+        self.assertIn("[reply-to-message]", submitted)
+        self.assertIn("引用广告", "\n".join(submitted.deterministic_parts))
+        message.delete.assert_not_awaited()
+
+    async def test_reference_image_vision_is_attributed_to_each_source(self) -> None:
+        message = _message()
+        message.reply_to_message = SimpleNamespace(photo=[SimpleNamespace(file_id="reply")])
+        message.external_reply = SimpleNamespace(document=SimpleNamespace(file_id="external"))
+        describe = AsyncMock(side_effect=[("", "回复图片广告"), ("", "外部图片广告")])
+        with patch("bot.handlers.group._append_image_context", new=describe):
+            reply, external = await group._reference_vision(message, object())
+        self.assertEqual((reply, external), ("回复图片广告", "外部图片广告"))
+        self.assertIs(describe.await_args_list[0].args[0].bot, message.bot)
+        self.assertIs(describe.await_args_list[1].args[0].bot, message.bot)
+
+    async def test_reply_image_evidence_reaches_moderation(self) -> None:
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=ModerationVerdict(
+                violated=False, reason="", rule=None, conclusive=True,
+            )),
+        )
+        message = _message()
+        message.reply_to_message = SimpleNamespace(photo=[SimpleNamespace(file_id="image")])
+        await self._run(
+            moderation, message=message,
+            reference=patch("bot.handlers.group._reference_vision", new=AsyncMock(return_value=("图片广告", ""))),
+        )
+        submitted = moderation.evaluate.await_args.args[2]
+        self.assertIn("图片广告", submitted.deterministic_parts)
+        self.assertIn("图片广告", dict(submitted.semantic_sections)["reply-to-message"])
+
+    async def test_member_media_keyboard_is_moderated_without_reply_pipeline(self) -> None:
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=ModerationVerdict(
+                violated=False, reason="", rule=None, conclusive=True,
+            )),
+        )
+        message = _message()
+        message.reply_markup = SimpleNamespace(inline_keyboard=[[
+            SimpleNamespace(text="广告按钮", url="https://offer.example"),
+        ]])
+
+        await self._run(moderation, message=message, msg_type="video")
+
+        submitted = moderation.evaluate.await_args.args[2]
+        self.assertIn("广告按钮", submitted)
+        self.assertIn("https://offer.example", submitted)
+        message.delete.assert_not_awaited()
+
     async def test_low_confidence_ban_rule_deletes_and_issues_challenge(self) -> None:
         rule = SimpleNamespace(
             id=15,

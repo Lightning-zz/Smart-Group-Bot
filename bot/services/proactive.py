@@ -742,7 +742,8 @@ class ProactiveTopicService:
             )
             if bool(getattr(self.memory, "automatic_compaction_enabled", True)):
                 await self.memory.compact_if_needed(group_id)
-        log.info("[%s] proactive topic sent | %s", group_id, reply[:80])
+        log.info("[%s] proactive topic sent | len=%d", group_id, len(reply))
+        log.debug("[%s] proactive topic preview | %s", group_id, reply[:80])
         return True
 
     async def _load_fresh_settings(self, group_id: int) -> dict[str, Any]:

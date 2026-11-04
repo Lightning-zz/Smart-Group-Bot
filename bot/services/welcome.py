@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import logging
 
+from aiogram.exceptions import TelegramAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
@@ -15,6 +16,7 @@ from bot.services.message_templates import (
     render_plain_template,
     send_template_with_fallback,
 )
+from bot.utils.logging_setup import sanitize_log_text
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -119,8 +121,15 @@ async def send_group_welcome(
             reply_markup=keyboard,
             disable_link_preview=disable_link_preview,
         )
-    except Exception:
-        log.warning("welcome send failed | group=%s user=%s", group_id, user_id)
+    except Exception as exc:
+        log.warning(
+            "welcome send failed | group=%s user=%s error_type=%s error=%s",
+            group_id,
+            user_id,
+            type(exc).__name__,
+            sanitize_log_text(exc)[:240],
+            exc_info=not isinstance(exc, (TelegramAPIError, TimeoutError)),
+        )
         return False
     await schedule_message_auto_delete_durable(
         sent, configured_auto_delete_seconds(settings, "welcome")

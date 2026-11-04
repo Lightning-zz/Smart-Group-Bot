@@ -26,7 +26,7 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
             chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
             from_user=SimpleNamespace(id=136817688, is_bot=True, username="Channel_Bot", full_name="Channel Bot"),
             sender_chat=SimpleNamespace(id=-1009876543210, username="test_channel", title="Test Channel"),
-            text="1",
+            text="",
             bot=SimpleNamespace(me=AsyncMock(return_value=SimpleNamespace(username="selfbot", id=1))),
         )
         group_row = SimpleNamespace(settings={})

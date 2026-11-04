@@ -2209,9 +2209,8 @@ class LLMService:
                     # Reuse the admission-time count instead of running the
                     # synchronous tokenizer a second time on the event loop.
                     tokens_in = prompt_tokens
-                preview, truncated = self._preview_for_log(content, limit=preview_limit)
                 log.info(
-                    "LLM response | stage=%s | model=%s | attempt=%d/%d | len=%d | tool_calls=%d | prompt_tokens=%s | output_tokens=%d | preview_truncated=%s | preview=%s",
+                    "LLM response | stage=%s | model=%s | attempt=%d/%d | len=%d | tool_calls=%d | prompt_tokens=%s | output_tokens=%d",
                     label_cn,
                     cfg.model,
                     attempt,
@@ -2220,9 +2219,13 @@ class LLMService:
                     len(tool_calls or []),
                     self.prompt_usage_text(messages, tools=tools, cfg=cfg, used_tokens=tokens_in),
                     tokens_out,
-                    truncated,
-                    preview,
                 )
+                if log.isEnabledFor(logging.DEBUG):
+                    preview, truncated = self._preview_for_log(content, limit=preview_limit)
+                    log.debug(
+                        "LLM response preview | stage=%s | model=%s | preview_truncated=%s | preview=%s",
+                        label_cn, cfg.model, truncated, preview,
+                    )
                 self._record_circuit_success(cfg, stage=label)
                 return resp
             except asyncio.TimeoutError:

@@ -15,6 +15,8 @@ from contextlib import asynccontextmanager
 from contextvars import Context
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import wraps
+from types import SimpleNamespace
 from typing import Any
 
 from aiogram import F, Router
@@ -116,6 +118,7 @@ from bot.services.join_screening import (
 )
 from bot.services.bot_screening import (
     is_bot_whitelisted,
+    remove_bot_whitelist,
     record_bot_screening_pass,
     reset_bot_screening,
 )
@@ -124,6 +127,11 @@ from bot.services.member_identity import member_display_name
 from bot.services.message_templates import card_field, render_summary_notice
 from bot.services.moderation import ModerationService
 from bot.services.moderation import ModerationVerdict
+from bot.services.moderation_input import build_moderation_input
+from bot.services.moderation_revision import (
+    is_current_moderation_revision,
+    moderation_revision_scope,
+)
 from bot.services.notification_pins import unpin_notification_message
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
@@ -140,6 +148,7 @@ from bot.services.update_completion import (
     request_current_update_retry,
 )
 from bot.utils.security import format_history_message_line
+from bot.utils.logging_setup import get_log_context, reset_log_context, set_log_context
 from bot.utils.timezone import now_shanghai_naive
 from bot.utils.telegram import (
     answer_with_auto_delete,
@@ -364,6 +373,8 @@ async def _send_moderation_notice_once_locked(
     # a scarce pooled connection.  Persisted retries remain at-least-once across
     # the unavoidable send-success/process-crash-before-marker window.
     await session.commit()
+    if not is_current_moderation_revision():
+        return False
     await answer_with_auto_delete(
         message,
         notice,
@@ -397,7 +408,7 @@ async def _fresh_group_authorized_for_moderation(
                 "[%s] moderation result discarded | reason=group_deauthorized",
                 group_id,
             )
-        return authorized
+        return authorized and is_current_moderation_revision()
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -425,6 +436,8 @@ async def _claim_current_moderation_verdict(
     overwritten by this stale worker.
     """
 
+    if not is_current_moderation_revision():
+        return False
     await session.rollback()
     await acquire_group_settings_write_intent(session, int(group_id))
     if manual_unban_generation_is_active(int(group_id), int(user_id)):
@@ -447,7 +460,23 @@ async def _claim_current_moderation_verdict(
         if current != expected:
             await session.rollback()
             return False
+    if not is_current_moderation_revision():
+        await session.rollback()
+        return False
     return True
+
+
+def _track_moderation_revision(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    @wraps(handler)
+    async def wrapped(message: Message, *args: Any, **kwargs: Any) -> Any:
+        # Register before the first await, so a newer edit invalidates an
+        # older model call even while the edit is still checking permissions.
+        with moderation_revision_scope(message):
+            if not is_current_moderation_revision():
+                return None
+            return await handler(message, *args, **kwargs)
+
+    return wrapped
 
 
 @dataclass(slots=True)
@@ -943,23 +972,27 @@ async def _screen_bot_sender_message(
     input_text: str,
     warn_target: str,
     flow_started: float,
-) -> None:
+    credit_clean_message: bool = True,
+    screening_complete: bool = True,
+) -> bool | None:
     """Moderate a message from another bot until it earns the whitelist.
 
     Bots cannot complete the human verification challenge, so any conclusive
     violation deletes the message and resets the clean-message counter; a
     high-confidence hit on a ban rule also bans the bot. Clean conclusive
     messages count toward the per-group whitelist threshold.
+    Return True only when a command using this review may continue; violations
+    and stale/discarded decisions never authorize command side effects.
     """
     if await moderation.is_user_exempt(session, group_id, bot_id):
         log.info("[%s] bot screening skipped | reason=manual_exempt bot=%s", group_id, bot_id)
-        return
+        return True
 
     # Admin bots (e.g. other management bots) get the same auto-exemption as
     # human admins. Not cached as a whitelist so a demotion re-screens them.
     if await _is_user_admin_cached(message):
         log.info("[%s] bot screening skipped | reason=tg_admin_bot bot=%s", group_id, bot_id)
-        return
+        return True
 
     # With no enabled rules every message would trivially "pass" and grant a
     # permanent whitelist before any real screening happened. Keep the counter
@@ -972,20 +1005,20 @@ async def _screen_bot_sender_message(
         rules_result = await session.execute(rules_stmt)
     if rules_result.scalar_one_or_none() is None:
         log.info("[%s] bot screening skipped | reason=no_enabled_rules bot=%s", group_id, bot_id)
-        return
+        return True
 
     threshold = max(1, int(settings.moderation.bot_screening_message_count))
     moderation_started = time.perf_counter()
     verdict = await moderation.evaluate(session, group_id, input_text)
     log.info(
-        "[%s]【流程】bot审核 | 完成 | bot=%s | 违规=%s | 置信度=%.2f | 原因=%s | 耗时=%dms",
+        "[%s]【流程】bot审核 | 完成 | bot=%s | 违规=%s | 置信度=%.2f | 耗时=%dms",
         group_id,
         bot_id,
         verdict.violated,
         verdict.confidence,
-        verdict.reason,
         int((time.perf_counter() - moderation_started) * 1000),
     )
+    log.debug("[%s] bot审核说明 | bot=%s reason=%s", group_id, bot_id, verdict.reason)
     if not await _fresh_group_authorized_for_moderation(session, group_id):
         return
 
@@ -1002,10 +1035,24 @@ async def _screen_bot_sender_message(
         )
         return
 
+    if not is_current_moderation_revision():
+        return
+
     if not verdict.violated:
-        if not verdict.conclusive:
-            # Unparseable moderation output: neither punish nor credit a pass.
-            return
+        if not verdict.conclusive or not screening_complete:
+            # Missing image evidence and unparseable model output cannot earn
+            # trust, although neither alone is grounds to punish/block a command.
+            if not screening_complete:
+                log.info("[%s] bot screening not credited | reason=image_evidence_incomplete bot=%s", group_id, bot_id)
+            # A conclusive verdict may have acquired SQLite's writer lock in
+            # the policy claim. Do not carry it into a command handler.
+            await session.rollback()
+            return True
+        if not credit_clean_message:
+            # Edits are revisions, not additional independent clean messages.
+            log.info("[%s] bot edit reviewed | bot=%s result=clean", group_id, bot_id)
+            await session.rollback()
+            return True
         count, whitelisted = await record_bot_screening_pass(
             session, group_id, bot_id, threshold
         )
@@ -1018,7 +1065,7 @@ async def _screen_bot_sender_message(
             threshold,
             whitelisted,
         )
-        return
+        return True
 
     if not verdict.conclusive:
         log.warning(
@@ -1034,12 +1081,27 @@ async def _screen_bot_sender_message(
         rule_action = "delete"
     ban_now = rule_action == "ban" and moderation.is_high_confidence(verdict)
 
+    # Revoke automatic trust and reset the counter in one short transaction.
+    # A normal new-message check must never observe a committed reset while
+    # the now-known violating bot still retains its whitelist.
+    revoked = False
+    if not credit_clean_message:
+        revoked = await remove_bot_whitelist(session, group_id, bot_id)
     await reset_bot_screening(session, group_id, bot_id)
+    if not is_current_moderation_revision():
+        await session.rollback()
+        return
     # Never wait for an application lock while holding SQLite's process-wide
     # writer lock.  Other moderation paths take these resources in the
     # opposite order, so publishing this small reset first removes the lock
     # inversion and keeps privileged database work moving.
     await session.commit()
+    if revoked:
+        log.warning(
+            "[%s] bot whitelist revoked after edited violation | bot=%s",
+            group_id,
+            bot_id,
+        )
 
     if ban_now:
         async with _moderation_user_lock(group_id, bot_id):
@@ -1096,14 +1158,20 @@ async def _screen_bot_sender_message(
                     await session.rollback()
                     return
                 await session.commit()
+                if not is_current_moderation_revision():
+                    return
                 try:
                     await message.delete()
-                except Exception:
+                except Exception as exc:
                     log.warning(
-                        "[%s] bot message delete failed | bot=%s",
+                        "[%s] bot message delete failed | bot=%s error_type=%s error=%s",
                         group_id,
                         bot_id,
+                        type(exc).__name__,
+                        exc,
                     )
+                if not is_current_moderation_revision():
+                    return
                 async def preserve_latest_ban() -> bool:
                     await session.rollback()
                     blocked = await verification_release_blocked_by_ban(
@@ -1281,14 +1349,18 @@ async def _screen_bot_sender_message(
             )
             await session.flush()
             await session.commit()
+            if not is_current_moderation_revision():
+                return
             if rule_action == "delete":
                 try:
                     await message.delete()
-                except Exception:
+                except Exception as exc:
                     log.warning(
-                        "[%s] bot moderation delete failed | bot=%s",
+                        "[%s] bot moderation delete failed | bot=%s error_type=%s error=%s",
                         group_id,
                         bot_id,
+                        type(exc).__name__,
+                        exc,
                     )
             notice = _build_moderation_notice(
                 warn_target=warn_target,
@@ -1536,6 +1608,15 @@ async def _apply_counted_moderation_ban(
             created = _violation_event_created(violation)
             stored_count = getattr(violation, "warning_count", None)
             if created or stored_count is None:
+                if not created:
+                    # A prior revision may have only produced a non-counted
+                    # warning/delete. The first counted ban verdict upgrades
+                    # the same event, but must publish its new outcome once.
+                    violation.message_text = str(input_text or "")[:500]
+                    violation.rule_id = (
+                        int(rule.id) if rule is not None and rule.id is not None else None
+                    )
+                    violation.notice_sent_at = None
                 count, should_ban = await moderation.add_warning(
                     session,
                     group_id,
@@ -1582,16 +1663,23 @@ async def _apply_counted_moderation_ban(
 
         violation_id = int(violation.id)
 
+        if not is_current_moderation_revision():
+            return None
         try:
             if not message_deleted:
                 await message.delete()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning(
+                "[%s] moderation delete failed | user=%s error_type=%s error=%s",
+                group_id, user_id, type(exc).__name__, exc,
+            )
 
         prior_ban_result = _violation_nullable_bool(violation, "ban_enforced")
         ban_enforced = bool(prior_ban_result) if prior_ban_result is not None else False
         ban_failure_note = ""
         ban_retryable = False
+        if not is_current_moderation_revision():
+            return None
         if should_ban and prior_ban_result is not True:
             async def preserve_latest_ban() -> bool:
                 await session.rollback()
@@ -3652,11 +3740,14 @@ async def _append_image_context(
         log.info("【视觉】识别为空")
         return text, ""
 
-    log.info("【视觉】识别结果 | %s", vision_text[:80])
+    log.info("【视觉】识别完成 | 字符数=%d", len(vision_text))
+    log.debug("【视觉】识别结果预览 | %s", vision_text[:80])
     return f"{text}\n[image-vision]\n{vision_text}", vision_text
 
 
-async def _build_reply_context_for_llm(message: Message, llm: LLMService) -> str:
+async def _build_reply_context_for_llm(
+    message: Message, llm: LLMService, *, reply_vision_text: str | None = None
+) -> str:
     """Build richer reply context, including best-effort vision for replied media."""
     base_context = extract_reply_context(message)
     lines = [line for line in (base_context.splitlines() if base_context else []) if line.strip()]
@@ -3666,13 +3757,61 @@ async def _build_reply_context_for_llm(message: Message, llm: LLMService) -> str
         return "\n".join(lines)
 
     reply_text, reply_type = extract_message_text(reply)
-    enriched_reply_text, vision_text = await _append_image_context(reply, llm, reply_text, reply_type)
+    if reply_vision_text is None:
+        enriched_reply_text, vision_text = await _append_image_context(reply, llm, reply_text, reply_type)
+    else:
+        vision_text = reply_vision_text
+        enriched_reply_text = f"{reply_text}\n[image-vision]\n{vision_text}"
     if vision_text:
         compact = re.sub(r"\s+", " ", (enriched_reply_text or "").strip())
         if compact:
             lines.append(f"[reply_to_enriched:{reply_type}] {_truncate_text(compact, 320)}")
 
     return "\n".join(lines)
+
+
+def _reference_has_image(message: Message) -> bool:
+    return any(
+        getattr(ref, field, None)
+        for ref in (getattr(message, "reply_to_message", None), getattr(message, "external_reply", None))
+        if ref is not None
+        for field in ("photo", "document", "animation", "sticker")
+    )
+
+
+def _has_screenable_image(message: object) -> bool:
+    """Conservatively identify media whose unavailable OCR must not earn trust."""
+    if getattr(message, "photo", None) or getattr(message, "sticker", None):
+        return True
+    document = getattr(message, "document", None)
+    if document is not None:
+        mime = getattr(document, "mime_type", "") or ""
+        if isinstance(mime, str) and mime.lower().startswith("image/"):
+            return True
+    animation = getattr(message, "animation", None)
+    if animation is not None:
+        mime = getattr(animation, "mime_type", "") or "image/gif"
+        return isinstance(mime, str) and not mime.lower().startswith("video/")
+    return False
+
+
+async def _reference_vision(message: Message, llm: LLMService) -> tuple[str, str]:
+    results = []
+    for ref in (getattr(message, "reply_to_message", None), getattr(message, "external_reply", None)):
+        kind = next((name for name in ("photo", "document", "animation", "sticker")
+                     if getattr(ref, name, None)), "") if ref is not None else ""
+        if not kind:
+            results.append("")
+            continue
+        # ExternalReplyInfo is not a Message and has no bound bot; use only
+        # its available image fields with the current message's bot.
+        image = SimpleNamespace(
+            bot=message.bot,
+            **{name: getattr(ref, name, None) for name in ("photo", "document", "animation", "sticker")},
+        )
+        _, vision = await _append_image_context(image, llm, "", kind)
+        results.append(vision)
+    return results[0], results[1]
 
 
 @dataclass(slots=True)
@@ -3694,6 +3833,7 @@ class _PendingReplyItem:
     mention_other: bool
     memory_entry: str = ""
     update_completion: UpdateCompletionReceipt | None = None
+    log_context: dict[str, Any] = field(default_factory=get_log_context)
 
 
 @dataclass(slots=True)
@@ -4936,7 +5076,8 @@ async def _process_pending_reply_batch(
                     if skill_result.text:
                         raw_reply = skill_result.text
                         reply_source = "skill"
-                        log.info("[%s] pending batch reply via skill | %s", group_id, raw_reply[:80])
+                        log.info("[%s] pending batch reply via skill | len=%d", group_id, len(raw_reply))
+                        log.debug("[%s] pending batch skill reply preview | %s", group_id, raw_reply[:80])
                     elif skill_handled:
                         reply_source = "skill"
                         log.info(
@@ -4986,11 +5127,12 @@ async def _process_pending_reply_batch(
                         if raw_reply:
                             reply_source = "casual"
                         log.info(
-                            "[%s] pending batch reply via casual | intent=%s | %s",
+                            "[%s] pending batch reply via casual | intent=%s len=%d",
                             group_id,
                             action,
-                            raw_reply[:80] if raw_reply else "(empty)",
+                            len(raw_reply or ""),
                         )
+                        log.debug("[%s] casual reply preview | %s", group_id, raw_reply[:80] if raw_reply else "(empty)")
 
                     if raw_reply and reply_source == "skill":
                         await progress.composing()
@@ -5012,11 +5154,11 @@ async def _process_pending_reply_batch(
                             )
                         if explicit_no_reply:
                             log.info(
-                                "[%s] pending batch reply explicitly skipped by model | source=%s reason=%s",
+                                "[%s] pending batch reply explicitly skipped by model | source=%s",
                                 group_id,
                                 reply_source,
-                                parsed_reply.reason or "model_declined_reply",
                             )
+                            log.debug("[%s] model skip reason | %s", group_id, parsed_reply.reason or "model_declined_reply")
                         else:
                             cleaned_specs: list[ReplyMessageSpec] = []
                             for candidate_spec in parsed_reply.message_specs:
@@ -5059,15 +5201,18 @@ async def _process_pending_reply_batch(
                         reply_source = "fallback"
                         silence_reply = False
                     if silence_reply:
-                        preview = _truncate_text(reply, 80) if reply else "-"
                         log.info(
-                            "[%s] pending batch reply suppressed | reason=%s source=%s intent=%s preview=%s",
+                            "[%s] pending batch reply suppressed | reason=%s source=%s intent=%s len=%d",
                             group_id,
                             silence_reason,
                             reply_source,
                             action,
-                            preview,
-                            )
+                            len(reply or ""),
+                        )
+                        log.debug(
+                            "[%s] pending batch suppressed reply preview | %s",
+                            group_id, _truncate_text(reply, 80) if reply else "-",
+                        )
                         reply = ""
                         reply_specs = []
                         delivery_plans = []
@@ -5635,12 +5780,35 @@ async def _process_pending_reply_batch_guarded(
         return _PendingReplyOutcome(succeeded=notified)
 
 
+def _pending_batch_log_context(
+    key: tuple[int, int], items: list[_PendingReplyItem]
+) -> dict[str, Any]:
+    def compact_ids(values: list[str]) -> str:
+        unique = list(dict.fromkeys(value for value in values if value not in {"", "-", "0"}))
+        visible = ",".join(unique[:8])
+        if len(unique) > 8:
+            visible += f",+{len(unique) - 8}"
+        return visible or "-"
+
+    message_ids = [str(getattr(item.message, "message_id", 0) or "-") for item in items]
+    first_message_id = message_ids[0] if message_ids else "-"
+    return {
+        "req_id": f"batch:{key[0]}:{key[1]}:{first_message_id}",
+        "flow_id": f"batch-{key[0]}-{key[1]}-{first_message_id}",
+        "update_id": compact_ids([str(item.log_context.get("update_id", "-")) for item in items]),
+        "chat_id": key[0],
+        "user_id": key[1],
+        "message_id": compact_ids(message_ids),
+    }
+
+
 async def _pending_reply_worker(key: tuple[int, int]) -> None:
     """Process one sender's batches sequentially until its queue is empty."""
 
     current_task = asyncio.current_task()
     active_items: list[_PendingReplyItem] = []
     active_delivery_receipt: _PendingReplyDeliveryReceipt | None = None
+    batch_tokens = None
     try:
         while True:
             while True:
@@ -5674,6 +5842,7 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
 
             if settings is not None and items:
                 active_delivery_receipt = _PendingReplyDeliveryReceipt()
+                batch_tokens = set_log_context(**_pending_batch_log_context(key, items))
                 outcome = await _process_pending_reply_batch_guarded(
                     key,
                     items,
@@ -5717,6 +5886,9 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                 _finish_pending_reply_items(items, succeeded=False)
             active_items = []
             active_delivery_receipt = None
+            if batch_tokens is not None:
+                reset_log_context(batch_tokens)
+                batch_tokens = None
 
             async with _PENDING_REPLY_LOCK:
                 state = _PENDING_REPLY_BATCHES.get(key)
@@ -5741,6 +5913,8 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
             active_delivery_receipt = None
         raise
     finally:
+        if batch_tokens is not None:
+            reset_log_context(batch_tokens)
         if active_items:
             _finish_pending_reply_items(active_items, succeeded=False)
         async with _PENDING_REPLY_LOCK:
@@ -5871,13 +6045,32 @@ async def flush_pending_inbound_batches() -> None:
     | F.audio
     | F.video_note
     | F.contact
+    | F.reply_markup
+    | F.quote
+    | F.reply_to_message
+    | F.external_reply
+    | F.poll
+    | F.game
+    | F.invoice
+    | F.venue
+    | F.checklist
 )
+@_track_moderation_revision
 async def on_group_message(
     message: Message,
     session: AsyncSession,
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
-) -> None:
+    *,
+    _edited: bool = False,
+    _moderation_only: bool = False,
+) -> bool | None:
+    """Review content, optionally without activity/archive/conversation work.
+
+    `_moderation_only` is for new command messages, not an edit: normal bot
+    whitelist and clean-message counting rules still apply. True explicitly
+    permits the caller's command; None means stop (including stale verdicts).
+    """
     if not is_group(message):
         return
     if not await ensure_group_authorized(message, session, settings):
@@ -5890,7 +6083,8 @@ async def on_group_message(
     # Signal the background proactive task before any DB/API await. The
     # persisted timestamp is committed immediately below; the in-process
     # revision closes the shorter pre-commit race during topic generation.
-    note_group_activity(group_id)
+    if not _edited and not _moderation_only:
+        note_group_activity(group_id)
     activity_kwargs: dict[str, Any] = {
         "group_id": group_id,
         "title": message.chat.title or "",
@@ -5898,14 +6092,17 @@ async def on_group_message(
     }
     if session_factory is not None:
         activity_kwargs["session_factory"] = session_factory
-    group_settings = await _record_group_activity_cas(session, **activity_kwargs)
+    group_settings = (
+        {} if _edited or _moderation_only else await _record_group_activity_cas(session, **activity_kwargs)
+    )
 
     text, msg_type = extract_message_text(message)
-    if not text:
-        return
+    moderation_input = build_moderation_input(message, text=text, msg_type=msg_type)
+    if not text and not moderation_input and not _reference_has_image(message):
+        return True
     input_text = text
     memory = memory_holder.get_optional()
-    if memory is not None:
+    if memory is not None and not _edited and not _moderation_only:
         await memory.archive_message(
             group_id,
             "user",
@@ -5942,14 +6139,16 @@ async def on_group_message(
             or not getattr(settings.moderation, "bot_screening_enabled", False)
             or bot_sender_id == int(getattr(bot_me, "id", 0) or 0)
         ):
-            return
-        if await is_bot_whitelisted(session, group_id, bot_sender_id):
+            return True
+        # Automatic trust for new messages must not exempt subsequent edits:
+        # otherwise a bot can turn its clean screening messages into ads.
+        if not _edited and await is_bot_whitelisted(session, group_id, bot_sender_id):
             log.info(
                 "[%s] bot screening skipped | reason=whitelisted bot=%s",
                 group_id,
                 bot_sender_id,
             )
-            return
+            return True
         llm = LLMService(
             settings.bot.main_model,
             settings.bot.decision_model,
@@ -5962,7 +6161,12 @@ async def on_group_message(
         input_text, bot_vision_text = await _append_image_context(
             message, llm, input_text, msg_type
         )
-        if memory is not None and (input_text != text or bot_vision_text):
+        reply_vision, external_vision = await _reference_vision(message, llm)
+        moderation_input = build_moderation_input(
+            message, text=text, msg_type=msg_type, vision_text=bot_vision_text,
+            reply_vision_text=reply_vision, external_reply_vision_text=external_vision,
+        )
+        if memory is not None and not _edited and not _moderation_only and (input_text != text or bot_vision_text):
             await memory.archive_message(
                 group_id,
                 "user",
@@ -5981,39 +6185,41 @@ async def on_group_message(
         # Placeholder-only media ("[voice]", "[video]", failed-vision images)
         # carry nothing to judge; a trivially-clean verdict must not credit a
         # pass toward the permanent whitelist, so skip them entirely.
-        has_screenable_content = (
-            msg_type == "text"
-            or "caption" in msg_type
-            or msg_type in {"contact", "document"}
-            or bool(bot_vision_text)
-        )
-        if not has_screenable_content:
+        if not moderation_input:
             log.info(
                 "[%s] bot screening skipped | reason=no_screenable_content bot=%s type=%s",
                 group_id,
                 bot_sender_id,
                 msg_type,
             )
-            return
-        await _screen_bot_sender_message(
+            return True
+        return await _screen_bot_sender_message(
             moderation=ModerationService(settings.moderation, llm),
             session=session,
             settings=settings,
             message=message,
             group_id=group_id,
             bot_id=bot_sender_id,
-            input_text=input_text,
+            input_text=moderation_input,
             warn_target=warn_target,
             flow_started=flow_started,
+            credit_clean_message=not _edited,
+            screening_complete=all(
+                bool(vision) or not _has_screenable_image(source)
+                for source, vision in (
+                    (message, bot_vision_text),
+                    (getattr(message, "reply_to_message", None), reply_vision),
+                    (getattr(message, "external_reply", None), external_vision),
+                )
+            ),
         )
-        return
 
     # Placeholder-only videos still bypass the text pipeline. Captions carry
     # user-controlled text and must pass moderation before we stop processing.
-    if msg_type in {"video", "video_note"}:
+    if msg_type in {"video", "video_note"} and not moderation_input and not _reference_has_image(message):
         log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
-        return
-    media_moderation_only = msg_type == "video_caption"
+        return True
+    media_moderation_only = msg_type in {"video", "video_note", "video_caption"} or not text
 
     mute_all_replies = bool(group_settings.get("mute_all_replies", False))
 
@@ -6049,12 +6255,19 @@ async def on_group_message(
     )
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
-    reply_context = await _build_reply_context_for_llm(message, llm)
+    reply_vision, external_vision = await _reference_vision(message, llm)
+    moderation_input = build_moderation_input(
+        message, text=text, msg_type=msg_type, vision_text=vision_text,
+        reply_vision_text=reply_vision, external_reply_vision_text=external_vision,
+    )
+    reply_context = "" if _edited or _moderation_only else await _build_reply_context_for_llm(
+        message, llm, reply_vision_text=reply_vision
+    )
     if reply_context:
         input_text = f"{input_text}\n{reply_context}"
     # Refresh the same archive event after authority/reply/media enrichment so
     # its sender snapshot is useful even when the message needed no AI vision.
-    if memory is not None:
+    if memory is not None and not _edited and not _moderation_only:
         await memory.archive_message(
             group_id,
             "user",
@@ -6072,7 +6285,7 @@ async def on_group_message(
                 sender_is_tg_admin=sender_is_tg_admin,
             ),
         )
-    if msg_type == "sticker":
+    if msg_type == "sticker" and not _edited and not _moderation_only:
         try:
             learned = await sticker_library.learn_from_message(
                 session,
@@ -6082,12 +6295,12 @@ async def on_group_message(
             )
             if learned:
                 log.info(
-                    "[%s] sticker learned: file_id=%s desc=%s seen=%s",
+                    "[%s] sticker learned: file_id=%s seen=%s",
                     group_id,
                     str(learned.get("file_id", ""))[:32],
-                    str(learned.get("description", ""))[:80],
                     learned.get("seen_count", 1),
                 )
+                log.debug("[%s] sticker description preview | %s", group_id, str(learned.get("description", ""))[:80])
         except Exception:
             await session.rollback()
             log.exception("[%s] sticker learning failed", group_id)
@@ -6127,21 +6340,31 @@ async def on_group_message(
         # Profile (name/username/bio) screening runs only on join and during
         # patrol; ordinary messages are moderated on their content alone.
 
-        if not auto_exempt_moderation and not manual_exempt:
-            verdict = await mod.evaluate(session, group_id, input_text)
+        if not auto_exempt_moderation and not manual_exempt and moderation_input:
+            verdict = await mod.evaluate(session, group_id, moderation_input)
             violated = verdict.violated
             reason = verdict.reason
             rule = verdict.rule
             log.info(
-                "[%s]【流程】审核 | 完成 | 违规=%s | 置信度=%.2f | 原因=%s | 耗时=%dms",
+                "[%s]【流程】审核 | 完成 | 违规=%s | 置信度=%.2f | 耗时=%dms",
                 group_id,
                 violated,
                 verdict.confidence,
-                reason,
                 int((time.perf_counter() - moderation_started) * 1000),
             )
+            log.debug("[%s] 审核说明 | reason=%s", group_id, reason)
             if not await _fresh_group_authorized_for_moderation(session, group_id):
                 return
+            if not is_current_moderation_revision():
+                return
+            if _moderation_only and verdict.conclusive and not violated:
+                # A command may have side effects after a slow review. Verify
+                # that its clean result still reflects the current policy.
+                if not await _claim_current_moderation_verdict(
+                    session, group_id=group_id, user_id=user_id, verdict=verdict,
+                ):
+                    return
+                await session.rollback()
             if violated:
                 action = str(rule.action if rule else "warn").strip().lower()
                 if action not in {"warn", "delete", "ban"}:
@@ -6171,13 +6394,15 @@ async def on_group_message(
                                     session,
                                     group_id,
                                     user_id,
-                                    input_text,
+                                    moderation_input,
                                     "challenge",
                                     rule,
                                     source_message_id=_source_message_id(message),
                                 )
                                 await session.flush()
                                 await session.commit()
+                                if not is_current_moderation_revision():
+                                    return
                                 try:
                                     await message.delete()
                                     message_deleted = True
@@ -6191,6 +6416,8 @@ async def on_group_message(
                                     session,
                                     challenge_violation,
                                 )
+                                if not is_current_moderation_revision():
+                                    return
                                 challenged = (
                                     getattr(challenge_violation, "notice_sent_at", None)
                                     is not None
@@ -6275,7 +6502,7 @@ async def on_group_message(
                             session,
                             group_id,
                             user_id,
-                            input_text,
+                            moderation_input,
                             "ban_applied",
                             rule,
                             source_message_id=source_message_id,
@@ -6284,6 +6511,8 @@ async def on_group_message(
                         if callable(flush):
                             await flush()
                         await session.commit()
+                        if not is_current_moderation_revision():
+                            return
                         prior_ban_result = _violation_nullable_bool(
                             violation,
                             "ban_enforced",
@@ -6309,6 +6538,8 @@ async def on_group_message(
                                         group_id,
                                         user_id,
                                     )
+                            if not is_current_moderation_revision():
+                                return
                             try:
                                 if not message_deleted:
                                     await message.delete()
@@ -6366,7 +6597,7 @@ async def on_group_message(
                             session,
                             group_id,
                             user_id,
-                            input_text,
+                            moderation_input,
                             "warn",
                             rule,
                             source_message_id=_source_message_id(message),
@@ -6415,18 +6646,23 @@ async def on_group_message(
                             session,
                             group_id,
                             user_id,
-                            input_text,
+                            moderation_input,
                             "delete",
                             rule,
                             source_message_id=_source_message_id(message),
                         )
                         await session.flush()
                         await session.commit()
+                        if not is_current_moderation_revision():
+                            return
                         try:
                             if not message_deleted:
                                 await message.delete()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log.warning(
+                                "[%s] moderation delete failed | user=%s error_type=%s error=%s",
+                                group_id, user_id, type(exc).__name__, exc,
+                            )
                         notice = _build_moderation_notice(
                             warn_target=warn_target,
                             reason=reason,
@@ -6457,7 +6693,7 @@ async def on_group_message(
                     message=message,
                     group_id=group_id,
                     user_id=user_id,
-                    input_text=input_text,
+                    input_text=moderation_input,
                     rule=rule,
                     message_deleted=message_deleted,
                     verdict=verdict,
@@ -6507,6 +6743,10 @@ async def on_group_message(
                 return
     else:
         log.info("[%s]【流程】审核 | 关闭", group_id)
+
+    if _edited or _moderation_only:
+        log.info("[%s] moderation-only review finished | message=%s", group_id, message.message_id)
+        return True
 
     if media_moderation_only:
         log.info("[%s]【结束】视频 caption 已完成审核", group_id)
@@ -6803,17 +7043,28 @@ async def on_group_message(
     | F.audio
     | F.video_note
     | F.contact
+    | F.reply_markup
+    | F.quote
+    | F.reply_to_message
+    | F.external_reply
+    | F.poll
+    | F.game
+    | F.invoice
+    | F.venue
+    | F.checklist
 )
+@_track_moderation_revision
 async def on_group_message_edited(
     message: Message,
     session: AsyncSession,
     settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
-    """Refresh the retained raw event when Telegram delivers an edit.
+    """Archive and re-moderate edits without rerunning conversational effects.
 
-    Edited updates are archived without entering the reply pipeline: an edit
-    should update memory truth, not trigger a second answer or moderation side
-    effect. ``edited_at`` remains available for audit and recall display.
+    The common moderation path keeps the original message id as its durable
+    violation key. Replays/edits therefore do not add warnings or notices twice.
+    Clean bot edits never count toward the automatic whitelist.
     """
 
     if not is_group(message):
@@ -6821,7 +7072,7 @@ async def on_group_message_edited(
     if not await ensure_group_authorized(message, session, settings):
         return
     text, msg_type = extract_message_text(message)
-    if not text:
+    if not text and not build_moderation_input(message, text=text, msg_type=msg_type) and not _reference_has_image(message):
         return
     sender_identity = _resolve_sender_identity(message)
     user = message.from_user
@@ -6839,19 +7090,40 @@ async def on_group_message_edited(
     sender_is_tg_admin = sender_is_group_identity or await _is_user_admin_cached(
         message
     )
-    await memory_holder.get().archive_message(
-        message.chat.id,
-        "user",
-        text,
-        message_id=str(message.message_id),
-        created_at=message.date,
-        message_type=msg_type,
-        defer_persistence=True,
-        **_message_archive_metadata(
+    try:
+        memory = memory_holder.get()
+        await memory.archive_message(
+            message.chat.id,
+            "user",
+            text,
+            message_id=str(message.message_id),
+            created_at=message.date,
+            message_type=msg_type,
+            defer_persistence=True,
+            **_message_archive_metadata(
+                message,
+                sender_identity=sender_identity,
+                raw_text=text,
+                sender_is_owner=sender_is_owner,
+                sender_is_tg_admin=sender_is_tg_admin,
+            ),
+        )
+    except Exception:
+        # Retention is best effort; an archive outage must not suppress
+        # the security review of an edited message.
+        log.exception(
+            "[%s] edited message archive failed; continuing moderation | message=%s",
+            message.chat.id,
+            message.message_id,
+        )
+    if (
+        is_current_moderation_revision()
+        and getattr(getattr(settings, "moderation", None), "enabled", False)
+    ):
+        await on_group_message(
             message,
-            sender_identity=sender_identity,
-            raw_text=text,
-            sender_is_owner=sender_is_owner,
-            sender_is_tg_admin=sender_is_tg_admin,
-        ),
-    )
+            session=session,
+            settings=settings,
+            session_factory=session_factory,
+            _edited=True,
+        )

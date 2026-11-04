@@ -1549,6 +1549,8 @@ async def init_db(
 
     engine_kwargs: dict[str, Any] = {
         "echo": False,
+        # Avoid including bound SQL values in engine/pool error logs.
+        "hide_parameters": True,
         "connect_args": {"timeout": _SQLITE_TIMEOUT_SECONDS} if is_sqlite else {},
     }
     if is_sqlite and str(parsed_url.database or "") not in {"", ":memory:"}:

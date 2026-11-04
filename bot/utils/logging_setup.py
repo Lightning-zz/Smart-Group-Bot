@@ -1,28 +1,36 @@
 from __future__ import annotations
 
 import atexit
+import asyncio
+import copy
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from datetime import datetime
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 from bot.services.resource_health import register_resource_health_provider
+from bot.utils.timezone import SHANGHAI_TZ
 
 _REQ_ID: ContextVar[str] = ContextVar("log_req_id", default="-")
 _UPDATE_ID: ContextVar[str] = ContextVar("log_update_id", default="-")
 _CHAT_ID: ContextVar[str] = ContextVar("log_chat_id", default="-")
 _USER_ID: ContextVar[str] = ContextVar("log_user_id", default="-")
+_MESSAGE_ID: ContextVar[str] = ContextVar("log_message_id", default="-")
 _FLOW_ID: ContextVar[str] = ContextVar("log_flow_id", default="-")
 
 _DEFAULT_FORMAT = (
-    "%(asctime)s.%(msecs)03d | %(level_cn)s | %(short_name)s | 流=%(flow_id)s | %(event)s"
+    "%(asctime)s | %(level_cn)s | %(short_name)s | 流=%(flow_id)s 请求=%(req_id)s "
+    "更新=%(update_id)s 群=%(chat_id)s 用户=%(user_id)s 消息=%(message_id)s "
+    "任务=%(task_name)s | %(event)s"
 )
 _DEFAULT_DATEFMT = "%Y-%m-%d %H:%M:%S"
 _LEVEL_CN = {
@@ -63,6 +71,53 @@ _LOG_SATURATED_SINCE: float | None = None
 _LOG_REAPER_THREADS: dict[threading.Thread, float] = {}
 _ATEXIT_REGISTERED = False
 
+_SECRET_VALUE_RE = re.compile(
+    r"(?i)(\b(?:[a-z0-9]+[_-]){0,6}(?:api[_-]?key|access[_-]?token|refresh[_-]?token|bot[_-]?token|"
+    r"config[_-]?master[_-]?key|client[_-]?secret|secret[_-]?key|secret|password|passwd|"
+    r"authorization|credential|signature|token)[\"']?\s*[:=]\s*)"
+    r"(?!\[REDACTED(?:_[A-Z_]+)?\])"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&\"'\]}]+)"
+)
+_AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
+_TELEGRAM_TOKEN_RE = re.compile(r"(?<![\w-])(?:bot)?\d{6,14}:[A-Za-z0-9_-]{20,}")
+_API_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@")
+_URL_SECRET_RE = re.compile(r"(?i)([?&](?:key|sig|auth|api_key|access_token|token)=)[^\s&#]+")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def sanitize_log_text(value: object, *, multiline: bool = False) -> str:
+    """Redact common credentials and neutralize untrusted terminal controls.
+
+    This is a last-line safeguard, not permission to log request bodies or
+    configuration documents. Tracebacks retain newlines; event values do not.
+    """
+    text = str(value)
+    text = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", text)
+    text = _SECRET_VALUE_RE.sub(r"\1[REDACTED]", text)
+    text = _TELEGRAM_TOKEN_RE.sub("[REDACTED_TELEGRAM_TOKEN]", text)
+    text = _API_KEY_RE.sub("[REDACTED_API_KEY]", text)
+    text = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
+    text = _URL_SECRET_RE.sub(r"\1[REDACTED]", text)
+
+    def escape(match: re.Match[str]) -> str:
+        char = match.group()
+        if multiline and char == "\n":
+            return char
+        return {"\n": r"\n", "\r": r"\r", "\t": r"\t"}.get(
+            char, f"\\u{ord(char):04x}"
+        )
+
+    return _CONTROL_RE.sub(escape, text)
+
+
+def attach_exception_log_context(error: BaseException) -> None:
+    """Keep correlation IDs after the update middleware unwinds its scope."""
+    try:
+        error._bot_log_context = get_log_context()  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+
 
 def logging_resource_health_snapshot() -> dict[str, Any]:
     global _LOG_SATURATED_SINCE
@@ -79,6 +134,7 @@ def logging_resource_health_snapshot() -> dict[str, Any]:
     queue_size = int(log_queue.qsize()) if log_queue is not None else 0
     queue_capacity = int(getattr(log_queue, "maxsize", 0) or 0)
     dropped = int(getattr(handler, "dropped_records", 0) or 0)
+    drop_snapshot = handler.drop_snapshot() if handler is not None else {}
     listener_alive = bool(thread is not None and thread.is_alive())
     queue_ratio = (
         float(queue_size) / float(queue_capacity) if queue_capacity > 0 else 0.0
@@ -116,6 +172,9 @@ def logging_resource_health_snapshot() -> dict[str, Any]:
         "queue_capacity": queue_capacity,
         "queue_ratio": round(queue_ratio, 4),
         "dropped_records": dropped,
+        "dropped_by_level": drop_snapshot.get("by_level", {}),
+        "unreported_dropped_records": drop_snapshot.get("unreported", 0),
+        "format_errors": int(getattr(handler, "format_errors", 0) or 0),
         "listener_alive": listener_alive,
         "saturated_seconds": round(saturated_age, 3),
         "retired_listener_reapers": len(reaper_ages),
@@ -131,6 +190,41 @@ class _FlushBarrier:
     event: threading.Event
 
 
+class _PriorityLogQueue(queue.Queue[Any]):
+    """FIFO with a warning/error reserve; producers never wait for sink I/O."""
+
+    def __init__(self, maxsize: int) -> None:
+        super().__init__(maxsize=max(2, maxsize))
+        self.normal_limit = self.maxsize - max(1, min(512, self.maxsize // 8))
+
+    def put_log_record(
+        self, record: logging.LogRecord
+    ) -> tuple[bool, logging.LogRecord | None]:
+        with self.not_full:
+            size = self._qsize()
+            if record.levelno < logging.WARNING and size >= self.normal_limit:
+                return False, record
+            displaced = None
+            if size >= self.maxsize:
+                # Only diagnostic records may be sacrificed, never a flush
+                # barrier/sentinel. An ERROR can displace WARNING, not vice versa.
+                lowest_level = record.levelno
+                displaced_index = None
+                for index, existing in enumerate(self.queue):
+                    if isinstance(existing, logging.LogRecord) and existing.levelno < lowest_level:
+                        lowest_level = existing.levelno
+                        displaced_index = index
+                        displaced = existing
+                if displaced_index is None:
+                    return False, record
+                del self.queue[displaced_index]
+                self.unfinished_tasks -= 1
+            self._put(record)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+            return True, displaced
+
+
 class _DroppingQueueHandler(QueueHandler):
     """Never block the asyncio/event-loop thread on log I/O.
 
@@ -142,26 +236,101 @@ class _DroppingQueueHandler(QueueHandler):
     def __init__(self, log_queue: queue.Queue[Any]) -> None:
         super().__init__(log_queue)
         self.dropped_records = 0
+        self.dropped_by_level: dict[str, int] = {}
+        self._unreported_drops: dict[str, int] = {}
+        self.format_errors = 0
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        # Unlike QueueHandler.prepare, keep the traceback separate from the
+        # event so its line breaks stay readable without enabling log injection
+        # through ordinary message fields. No live traceback crosses threads.
+        prepared = copy.copy(record)
+        try:
+            message = record.getMessage()
+        except Exception:
+            with self.lock:
+                self.format_errors += 1
+            message = "[日志记录格式化失败；原始参数已隐藏]"
+        prepared.msg = sanitize_log_text(message)
+        prepared.args = None
+        if record.exc_info:
+            prepared.exc_text = sanitize_log_text(
+                logging.Formatter().formatException(record.exc_info), multiline=True
+            )
+        elif record.exc_text:
+            prepared.exc_text = sanitize_log_text(record.exc_text, multiline=True)
+        prepared.exc_info = None
+        if prepared.stack_info:
+            prepared.stack_info = sanitize_log_text(prepared.stack_info, multiline=True)
+        return prepared
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Never let stdlib ``handleError`` echo untrusted ``record.args``."""
+        with self.lock:
+            self.format_errors += 1
+
+    def _record_drop(self, record: logging.LogRecord) -> None:
+        with self.lock:
+            self.dropped_records += 1
+            level = record.levelname
+            self.dropped_by_level[level] = self.dropped_by_level.get(level, 0) + 1
+            self._unreported_drops[level] = self._unreported_drops.get(level, 0) + 1
+
+    def drop_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "by_level": dict(self.dropped_by_level),
+                "unreported": sum(self._unreported_drops.values()),
+            }
+
+    def recovery_summary(self) -> logging.LogRecord | None:
+        with self.lock:
+            if not self._unreported_drops or self.queue.qsize() > self.queue.maxsize // 2:
+                return None
+            counts = self._unreported_drops
+            self._unreported_drops = {}
+        return logging.LogRecord(
+            "bot.logging", logging.WARNING, __file__, 0,
+            "日志队列已恢复 | 丢弃=%d | 按级别=%s | 高等级日志优先保留",
+            (sum(counts.values()), counts), None,
+        )
 
     def enqueue(self, record: logging.LogRecord) -> None:
+        if isinstance(self.queue, _PriorityLogQueue):
+            _accepted, dropped = self.queue.put_log_record(record)
+            if dropped is not None:
+                self._record_drop(dropped)
+            return
         try:
             self.queue.put_nowait(record)
         except queue.Full:
-            self.dropped_records += 1
+            self._record_drop(record)
 
 
 class _BoundedQueueListener(QueueListener):
     """QueueListener with flush barriers and a bounded, non-hanging stop."""
 
+    drop_handler: _DroppingQueueHandler | None = None
+
+    def _report_recovery(self) -> None:
+        if self.drop_handler is not None:
+            summary = self.drop_handler.recovery_summary()
+            if summary is not None:
+                # Emit from the listener itself, never recursively enqueue or
+                # make the asyncio producer perform stream/file I/O.
+                super().handle(summary)
+
     def handle(self, record: Any) -> None:
         if isinstance(record, _FlushBarrier):
             try:
+                self._report_recovery()
                 for handler in self.handlers:
                     handler.flush()
             finally:
                 record.event.set()
             return
         super().handle(record)
+        self._report_recovery()
 
     def stop_bounded(self, timeout: float) -> bool:
         thread = self._thread
@@ -206,11 +375,25 @@ class _SecureRotatingFileHandler(RotatingFileHandler):
 
 class LogContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.req_id = _REQ_ID.get()
-        record.update_id = _UPDATE_ID.get()
-        record.chat_id = _CHAT_ID.get()
-        record.user_id = _USER_ID.get()
-        record.flow_id = _FLOW_ID.get()
+        context = get_log_context()
+        error = record.exc_info[1] if record.exc_info else None
+        for _ in range(8):
+            if error is None:
+                break
+            saved = getattr(error, "_bot_log_context", None)
+            if isinstance(saved, dict):
+                for key in context:
+                    if context[key] == "-" and saved.get(key) is not None:
+                        context[key] = saved[key]
+                break
+            error = error.__cause__ or error.__context__
+        for key, value in context.items():
+            setattr(record, key, sanitize_log_text(value))
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        record.task_name = sanitize_log_text(task.get_name() if task else threading.current_thread().name)
         return True
 
 
@@ -218,6 +401,12 @@ class ChineseLogFormatter(logging.Formatter):
     def __init__(self, *args: Any, use_color: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.use_color = use_color
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        timestamp = datetime.fromtimestamp(record.created, SHANGHAI_TZ)
+        if datefmt is None or datefmt == _DEFAULT_DATEFMT:
+            return timestamp.isoformat(sep=" ", timespec="milliseconds")
+        return timestamp.strftime(datefmt)
 
     @staticmethod
     def _short_name(name: str) -> str:
@@ -243,9 +432,10 @@ class ChineseLogFormatter(logging.Formatter):
         level_cn = _LEVEL_CN.get(record.levelname, record.levelname)
         level_color = _LEVEL_COLORS.get(record.levelname, "")
         record.level_cn = self._paint(level_cn, level_color)
-        record.short_name = self._short_name(record.name)
-        record.flow_id = getattr(record, "flow_id", "-")
-        record.event = self._colorize_event(record.getMessage())
+        record.short_name = sanitize_log_text(self._short_name(record.name))
+        for field in ("req_id", "flow_id", "update_id", "chat_id", "user_id", "message_id", "task_name"):
+            setattr(record, field, sanitize_log_text(getattr(record, field, "-")))
+        record.event = self._colorize_event(sanitize_log_text(record.getMessage()))
         record.message = record.event
         if self.usesTime():
             record.asctime = self.formatTime(record, self.datefmt)
@@ -257,11 +447,20 @@ class ChineseLogFormatter(logging.Formatter):
         if record.exc_text:
             if s and s[-1:] != "\n":
                 s += "\n"
-            s += record.exc_text
+            # Every continuation is visibly subordinate to this record; a
+            # remote exception containing a newline cannot forge a top-level
+            # log entry while genuine Python tracebacks remain readable.
+            s += "\n".join(
+                f"    {line}"
+                for line in sanitize_log_text(record.exc_text, multiline=True).splitlines()
+            )
         if record.stack_info:
             if s and s[-1:] != "\n":
                 s += "\n"
-            s += self.formatStack(record.stack_info)
+            s += "\n".join(
+                f"    {line}"
+                for line in sanitize_log_text(self.formatStack(record.stack_info), multiline=True).splitlines()
+            )
         return s
 
 
@@ -435,7 +634,7 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
         default=logging.WARNING,
     )
     if config is not None:
-        color_mode = str(getattr(config, "color", "on") or "on").strip().lower()
+        color_mode = str(getattr(config, "color", "auto") or "auto").strip().lower()
         log_to_file = bool(getattr(config, "to_file", False))
         log_file_path_raw = str(
             getattr(config, "file_path", "data/bot.log") or "data/bot.log"
@@ -443,7 +642,7 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
         log_file_max_bytes = max(1024, int(getattr(config, "file_max_bytes", 5 * 1024 * 1024)))
         log_file_backup_count = max(1, int(getattr(config, "file_backup_count", 3)))
     else:
-        color_mode = os.getenv("LOG_COLOR", "on").strip().lower()
+        color_mode = os.getenv("LOG_COLOR", "auto").strip().lower()
         log_to_file = _parse_bool(os.getenv("LOG_TO_FILE"), default=False)
         log_file_path_raw = (
             (os.getenv("LOG_FILE_PATH") or "data/bot.log").strip()
@@ -507,11 +706,13 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
             sink_handlers.append(file_handler)
         except Exception as exc:
             try:
-                sys.stderr.write(f"[logging_setup] enable file logging failed: {exc}\n")
+                sys.stderr.write(
+                    f"[logging_setup] enable file logging failed: {sanitize_log_text(exc)}\n"
+                )
             except Exception:
                 pass
 
-    log_queue: queue.Queue[Any] = queue.Queue(maxsize=queue_size)
+    log_queue = _PriorityLogQueue(maxsize=queue_size)
     queue_handler = _DroppingQueueHandler(log_queue)
     # ContextVars belong to the event-loop thread. Capture them before the
     # record crosses into the listener thread.
@@ -521,6 +722,7 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
         *sink_handlers,
         respect_handler_level=True,
     )
+    listener.drop_handler = queue_handler
     listener.start()
 
     old_handlers = list(root.handlers)
@@ -566,6 +768,7 @@ def set_log_context(
     update_id: str | int | None = None,
     chat_id: str | int | None = None,
     user_id: str | int | None = None,
+    message_id: str | int | None = None,
 ) -> dict[str, Token[str]]:
     tokens: dict[str, Token[str]] = {}
     if req_id is not None:
@@ -578,6 +781,8 @@ def set_log_context(
         tokens["chat"] = _CHAT_ID.set(str(chat_id))
     if user_id is not None:
         tokens["user"] = _USER_ID.set(str(user_id))
+    if message_id is not None:
+        tokens["message"] = _MESSAGE_ID.set(str(message_id))
     return tokens
 
 
@@ -588,8 +793,9 @@ def reset_log_context(tokens: dict[str, Token[str]]) -> None:
         "update": _UPDATE_ID,
         "chat": _CHAT_ID,
         "user": _USER_ID,
+        "message": _MESSAGE_ID,
     }
-    for key in ("user", "chat", "update", "flow", "req"):
+    for key in ("message", "user", "chat", "update", "flow", "req"):
         token = tokens.get(key)
         if token is None:
             continue
@@ -604,4 +810,5 @@ def get_log_context() -> dict[str, Any]:
         "update_id": _UPDATE_ID.get(),
         "chat_id": _CHAT_ID.get(),
         "user_id": _USER_ID.get(),
+        "message_id": _MESSAGE_ID.get(),
     }

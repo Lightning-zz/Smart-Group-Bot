@@ -545,7 +545,7 @@ class StickerSettingsConfig(StrictModel):
 class LoggingSettingsConfig(StrictModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     third_party_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
-    color: Literal["on", "off", "auto"] = "on"
+    color: Literal["on", "off", "auto"] = "auto"
     to_file: bool = False
     file_path: str = Field(default="data/bot.log", max_length=1000)
     file_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=10 * 1024 * 1024 * 1024)
@@ -1990,7 +1990,7 @@ def build_legacy_runtime_config(
             ),
             color=_env_choice(
                 "LOG_COLOR",
-                "on",
+                "auto",
                 {"on", "off", "auto"},
                 values=raw_env,
             ),

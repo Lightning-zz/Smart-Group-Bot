@@ -2627,16 +2627,79 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         from bot import __main__ as bot_main
         from bot.middlewares.db import DbSessionMiddleware
+        from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
+        from bot.middlewares.logging_mw import LoggingMiddleware
+        from bot.middlewares.update_dedup import DurableInboxUpdateDedupMiddleware
+        from bot.middlewares.verification_gate import PendingVerificationGateMiddleware
 
         dispatcher = _MainDispatcher()
         session_factory = object()
 
         bot_main._register_update_middlewares(dispatcher, session_factory)
 
+        self.assertIsInstance(dispatcher.update.outer_middlewares[0], LoggingMiddleware)
+        self.assertIsInstance(dispatcher.update.outer_middlewares[1], DurableInboxUpdateDedupMiddleware)
+        self.assertFalse(any(isinstance(item, LoggingMiddleware) for item in dispatcher.message.middlewares))
+        self.assertEqual(len(dispatcher.edited_message.outer_middlewares), 2)
+        self.assertIsInstance(dispatcher.edited_message.outer_middlewares[0], GlobalBanEnforcementMiddleware)
+        self.assertIsInstance(dispatcher.edited_message.outer_middlewares[1], PendingVerificationGateMiddleware)
         self.assertEqual(len(dispatcher.edited_message.middlewares), 1)
         middleware = dispatcher.edited_message.middlewares[0]
         self.assertIsInstance(middleware, DbSessionMiddleware)
         self.assertIs(middleware.session_factory, session_factory)
+
+    async def test_edited_update_runs_security_gates_before_handler(self) -> None:
+        from bot import __main__ as bot_main
+        from bot.services.update_completion import (
+            UpdateCompletionReceipt,
+            bind_update_completion,
+            reset_update_completion,
+        )
+
+        seen: list[str] = []
+
+        class Gate:
+            def __init__(self, name: str, *, stop: bool = False) -> None:
+                self.name = name
+                self.stop = stop
+
+            async def __call__(self, handler, event, data):
+                seen.append(self.name)
+                if self.stop:
+                    return None
+                return await handler(event, data)
+
+        dispatcher = Dispatcher()
+
+        @dispatcher.edited_message()
+        async def handler(_message):
+            seen.append("handler")
+
+        with (
+            patch.object(bot_main, "GlobalBanEnforcementMiddleware", side_effect=lambda _: Gate("ban")),
+            patch.object(bot_main, "PendingVerificationGateMiddleware", side_effect=lambda _: Gate("verification", stop=True)),
+        ):
+            bot_main._register_update_middlewares(dispatcher, object())
+
+        bot = Bot("42:TEST_TOKEN")
+        receipt = UpdateCompletionReceipt()
+        token = bind_update_completion(receipt)
+        try:
+            await dispatcher.feed_raw_update(bot, {
+                "update_id": 901,
+                "edited_message": {
+                    "message_id": 7,
+                    "date": 1,
+                    "edit_date": 2,
+                    "chat": {"id": -1001, "type": "supergroup"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "User"},
+                    "text": "edited",
+                },
+            })
+        finally:
+            reset_update_completion(token)
+            await bot.session.close()
+        self.assertEqual(seen, ["ban", "verification"])
 
     async def test_bootstrap_validation_runs_before_database_initialization(self) -> None:
         from bot import __main__ as bot_main

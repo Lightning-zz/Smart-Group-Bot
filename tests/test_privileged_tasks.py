@@ -23,8 +23,10 @@ from bot.services.request_priority import ExecutionPriority, current_execution_p
 from bot.services.update_completion import (
     UpdateCompletionReceipt,
     bind_update_completion,
+    current_update_completion,
     reset_update_completion,
 )
+from bot.utils.logging_setup import get_log_context, reset_log_context, set_log_context
 from bot.web import settings_api
 
 
@@ -50,6 +52,43 @@ class _FakeSessionFactory:
 
 
 class PrivilegedTaskRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_job_logs_capture_submission_ids_without_receipt_context(self) -> None:
+        observed: list[dict[str, object]] = []
+        observed_receipts: list[object] = []
+
+        async def operation() -> None:
+            observed.append(get_log_context())
+            observed_receipts.append(current_update_completion())
+
+        try:
+            with patch("bot.services.privileged_tasks._CRITICAL_WORKERS", 1):
+                for update_id in (701, 702, "-"):
+                    receipt = UpdateCompletionReceipt()
+                    receipt_token = bind_update_completion(receipt)
+                    tokens = set_log_context(
+                        update_id=update_id, chat_id=-1001, user_id=42, message_id=9
+                    )
+                    try:
+                        submission = submit_privileged_task(
+                            key=f"logging-context-job-{update_id}",
+                            label="logging context",
+                            operation=operation,
+                            lane="critical",
+                        )
+                    finally:
+                        reset_log_context(tokens)
+                        reset_update_completion(receipt_token)
+                    self.assertTrue(await wait_privileged_task(submission.job_id, timeout_seconds=1.0))
+                    self.assertTrue(await receipt.wait())
+        finally:
+            await flush_privileged_tasks(timeout_seconds=1.0)
+        self.assertEqual([context["update_id"] for context in observed], ["701", "702", "-"])
+        self.assertEqual(observed[0]["chat_id"], "-1001")
+        self.assertEqual(observed[0]["user_id"], "42")
+        self.assertEqual(observed[0]["message_id"], "9")
+        self.assertEqual(observed_receipts, [None, None, None])
+        self.assertTrue(all(value == "-" for value in get_log_context().values()))
+
     async def test_critical_lane_is_not_starved_by_security_jobs(self) -> None:
         release = asyncio.Event()
         all_security_started = asyncio.Event()

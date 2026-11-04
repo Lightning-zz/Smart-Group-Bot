@@ -252,16 +252,16 @@ class WebSearchSkill:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 last_error = "search_timeout"
-                log.warning("websearch total timeout: query=%s", q)
+                log.warning("websearch total timeout: query_chars=%d", len(q))
                 break
             log.info(
-                "websearch try=%d/%d kind=%s region=%s backend=%s query=%s",
+                "websearch try=%d/%d kind=%s region=%s backend=%s query_chars=%d",
                 idx,
                 len(attempts),
                 kind,
                 region,
                 backend,
-                query,
+                len(query),
             )
             try:
                 rows = await run_search_thread(
@@ -286,21 +286,21 @@ class WebSearchSkill:
             except TimeoutError:
                 last_error = "search_timeout"
                 log.warning(
-                    "websearch attempt timed out: kind=%s region=%s backend=%s query=%s",
+                    "websearch attempt timed out: kind=%s region=%s backend=%s query_chars=%d",
                     kind,
                     region,
                     backend,
-                    query,
+                    len(query),
                 )
                 continue
             except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
                 log.warning(
-                    "websearch attempt failed: kind=%s region=%s backend=%s query=%s error=%s",
+                    "websearch attempt failed: kind=%s region=%s backend=%s query_chars=%d error=%s",
                     kind,
                     region,
                     backend,
-                    query,
+                    len(query),
                     exc,
                 )
                 continue

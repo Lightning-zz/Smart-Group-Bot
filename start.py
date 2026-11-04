@@ -114,6 +114,6 @@ if __name__ == "__main__":
         run_bot()
     except KeyboardInterrupt:
         print("\nExited.")
-    except Exception as exc:
-        log.error("Startup failed: %s", exc)
+    except Exception:
+        log.exception("Startup failed")
         sys.exit(1)
