@@ -979,14 +979,14 @@
           </div>
         </section>
         <section class="settings-section">
-          ${sectionHead("刷屏广告识别", "群规（关键词/正则/语义）未命中时的补充检测：同一成员在短窗口内重复发送相似内容或链接即判定为刷屏广告。强信号自动删除消息并记录违规，弱信号仅私信通知管理员人工确认。")}
+          ${sectionHead("刷屏广告识别", "群规（关键词/正则/语义）未命中时的补充检测：同一成员在短窗口内重复发送相似内容或链接即判定为刷屏广告。强信号会删除该成员的全部近期消息并发起人机质询，质询超时或失败即封禁；弱信号仅私信通知管理员人工确认。")}
           <div class="field-grid three">
             ${toggle("moderation.spam_flood_enabled", "启用刷屏广告识别", "针对“每条都不违规、但重复刷屏”的广告消息")}
             ${field("moderation.spam_flood_window_seconds", "统计窗口（秒）", { type: "number", min: 30, max: 86400, step: 1, required: true, hint: "在该时间窗口内统计同一成员的发送行为，默认 300 秒" })}
             ${field("moderation.spam_flood_min_messages", "最少消息数", { type: "number", min: 2, max: 100, step: 1, required: true, hint: "窗口内达到该条数才进入候选，默认 4" })}
             ${field("moderation.spam_flood_similarity_min_hits", "相似消息数下限", { type: "number", min: 2, max: 100, step: 1, required: true, hint: "判定为强信号所需的相似消息数，默认 3" })}
             ${field("moderation.spam_flood_similarity_threshold", "相似度阈值", { type: "number", min: 0.5, max: 1, step: 0.01, required: true, hint: "0-1，越高越严格，默认 0.85" })}
-            ${field("moderation.spam_flood_strong_score", "强信号阈值", { type: "number", min: 0.5, max: 1, step: 0.01, required: true, hint: "达到后自动删除消息并记录违规，默认 0.85" })}
+            ${field("moderation.spam_flood_strong_score", "强信号阈值", { type: "number", min: 0.5, max: 1, step: 0.01, required: true, hint: "达到后删除该成员全部近期消息并发起人机质询，未通过则封禁，默认 0.85" })}
             ${field("moderation.spam_flood_weak_score", "弱信号阈值", { type: "number", min: 0, max: 1, step: 0.01, required: true, hint: "达到后仅通知管理员人工确认，默认 0.5" })}
             ${toggle("moderation.spam_flood_notify_admin", "弱信号通知管理员", "弱信号命中时私信通知群管理员人工确认")}
           </div>

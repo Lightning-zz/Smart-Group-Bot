@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from bot.handlers import group
 from bot.services import spam_flood
@@ -65,20 +65,59 @@ class FloodHandlerTests(unittest.IsolatedAsyncioTestCase):
         identity = SimpleNamespace(display_name="Spammer", username="spamguy")
         settings = _settings()
 
-        handled = False
-        for index in range(4):
-            handled = await group._screen_message_for_flood(
-                session=session,
-                message=message,
-                settings=settings,
-                group_id=-100,
-                user_id=7,
-                message_text="限时优惠 加@xinbi888 领取 https://t.me/abc",
-                sender_identity=identity,
-            )
+        delete_recent = AsyncMock(return_value=3)
+        ban = AsyncMock(return_value=True)
+        with patch.object(group, "delete_recent_member_messages", new=delete_recent), \
+             patch.object(group, "moderation_challenge_ready", return_value=False), \
+             patch.object(group, "ban_member", new=ban):
+            handled = False
+            for index in range(4):
+                handled = await group._screen_message_for_flood(
+                    session=session,
+                    message=message,
+                    settings=settings,
+                    group_id=-100,
+                    user_id=7,
+                    message_text="限时优惠 加@xinbi888 领取 https://t.me/abc",
+                    sender_identity=identity,
+                )
         self.assertTrue(handled)
         message.delete.assert_awaited()
-        session.add.assert_called()
+        delete_recent.assert_awaited()
+        ban.assert_awaited_once()
+
+    async def test_strong_hit_issues_challenge_when_available(self) -> None:
+        bot = SimpleNamespace(
+            me=AsyncMock(return_value=SimpleNamespace(id=999)),
+            get_chat_administrators=AsyncMock(return_value=[]),
+            send_message=AsyncMock(),
+        )
+        session = SimpleNamespace(add=MagicMock(), flush=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock())
+        message = _message(bot=bot)
+        identity = SimpleNamespace(display_name="Spammer", username="spamguy")
+        settings = _settings()
+
+        challenge = AsyncMock(return_value=True)
+        ban = AsyncMock(return_value=True)
+        with patch.object(group, "delete_recent_member_messages", new=AsyncMock(return_value=2)), \
+             patch.object(group, "moderation_challenge_ready", return_value=True), \
+             patch.object(group, "begin_moderation_challenge", new=challenge), \
+             patch.object(group, "ban_member", new=ban):
+            handled = False
+            for index in range(4):
+                handled = await group._screen_message_for_flood(
+                    session=session,
+                    message=message,
+                    settings=settings,
+                    group_id=-100,
+                    user_id=7,
+                    message_text="限时优惠 加@xinbi888 领取 https://t.me/abc",
+                    sender_identity=identity,
+                )
+        self.assertTrue(handled)
+        challenge.assert_awaited_once()
+        self.assertEqual(challenge.await_args.kwargs["rule_action"], "ban")
+        ban.assert_not_awaited()
 
     async def test_weak_hit_notifies_but_does_not_handle(self) -> None:
         bot = SimpleNamespace(

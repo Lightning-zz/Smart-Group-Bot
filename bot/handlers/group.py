@@ -130,6 +130,7 @@ from bot.services.violation_notice import (
     notify_admins_of_violation,
 )
 from bot.services import spam_flood
+from bot.services.recent_messages import delete_recent_member_messages
 from bot.services.violation_notice import _resolve_group_admin_ids as _resolve_flood_admin_ids
 from bot.services.moderation import ModerationService
 from bot.services.moderation import ModerationVerdict
@@ -407,11 +408,130 @@ async def _notify_flood_admins(
     return delivered
 
 
+async def _handle_strong_flood(
+    *,
+    session: AsyncSession,
+    message: Message,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    group_id: int,
+    user_id: int,
+    message_text: str,
+    display_name: str,
+    username: str,
+    group_title: str,
+    verdict: spam_flood.FloodVerdict,
+) -> None:
+    """Strong flood hit: purge the sender's messages, then challenge or ban.
+
+    Sequence per policy:
+      1. Record a violation row so the ledger reflects the action.
+      2. Delete every message we still track for this sender (up to the Bot API
+         48h window), not just the triggering one.
+      3. Start the shared human challenge (reused from moderation).  It mutes
+         the sender and, on timeout/failure, bans them automatically because it
+         is created with ``ban_on_timeout``.
+      4. If the challenge cannot be issued (no captcha provider configured),
+         fall back to an immediate ban so a prolific spammer is never left
+         able to keep posting.
+
+    Best-effort throughout: every step is guarded so one failure cannot abort
+    the others.
+    """
+    async with _moderation_user_lock(group_id, user_id):
+        try:
+            await _persist_flood_violation(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+                message_text=message_text,
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            log.warning(
+                "[%s] flood violation persist failed | user=%s", group_id, user_id, exc_info=True
+            )
+
+        # Delete the triggering message plus every other tracked message from
+        # this sender, so the flood leaves no residue behind.
+        try:
+            await message.delete()
+        except Exception as exc:
+            log.warning(
+                "[%s] flood delete failed | user=%s error=%s",
+                group_id,
+                user_id,
+                type(exc).__name__,
+            )
+        try:
+            purged = await delete_recent_member_messages(message.bot, group_id, user_id)
+            if purged:
+                log.info(
+                    "[%s] flood purge deleted %d recent message(s) | user=%s",
+                    group_id,
+                    purged,
+                    user_id,
+                )
+        except Exception:
+            log.warning(
+                "[%s] flood purge failed | user=%s", group_id, user_id, exc_info=True
+            )
+
+        challenged = False
+        if moderation_challenge_ready(settings):
+            try:
+                challenged = await begin_moderation_challenge(
+                    bot=message.bot,
+                    session=session,
+                    settings=settings,
+                    group_id=group_id,
+                    user_id=user_id,
+                    display_name=display_name,
+                    bot_username=getattr(getattr(message, "bot", None), "username", "") or "",
+                    reason=verdict.reason or "疑似刷屏广告",
+                    rule_action="ban",
+                    session_factory=session_factory,
+                )
+            except Exception:
+                log.warning(
+                    "[%s] flood challenge failed | user=%s", group_id, user_id, exc_info=True
+                )
+                challenged = False
+        if challenged:
+            log.info("[%s] flood challenge issued | user=%s", group_id, user_id)
+        else:
+            # No challenge transport: ban immediately to stop the flood.
+            try:
+                banned = await ban_member(message.bot, group_id, user_id)
+                log.info(
+                    "[%s] flood fallback ban | user=%s banned=%s", group_id, user_id, banned
+                )
+            except Exception:
+                log.warning(
+                    "[%s] flood fallback ban failed | user=%s", group_id, user_id, exc_info=True
+                )
+
+    await _notify_flood_admins(
+        bot=message.bot,
+        session=session,
+        group_id=group_id,
+        user_id=user_id,
+        message_text=message_text,
+        display_name=display_name,
+        username=username,
+        group_title=group_title,
+        verdict=verdict,
+        settings=settings,
+    )
+
+
 async def _screen_message_for_flood(
     *,
     session: AsyncSession,
     message: Message,
     settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
     group_id: int,
     user_id: int,
     message_text: str,
@@ -476,32 +596,11 @@ async def _screen_message_for_flood(
     )
 
     if verdict.is_strong:
-        # Strong evidence: delete the current message and record a violation so
-        # the existing warn/ban ledger and admin notices stay consistent.
-        async with _moderation_user_lock(group_id, user_id):
-            try:
-                await _persist_flood_violation(
-                    session,
-                    group_id=group_id,
-                    user_id=user_id,
-                    message_text=message_text,
-                )
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                log.warning("[%s] flood violation persist failed | user=%s", group_id, user_id, exc_info=True)
-            try:
-                await message.delete()
-            except Exception as exc:
-                log.warning(
-                    "[%s] flood delete failed | user=%s error=%s",
-                    group_id,
-                    user_id,
-                    type(exc).__name__,
-                )
-        await _notify_flood_admins(
-            bot=message.bot,
+        await _handle_strong_flood(
             session=session,
+            message=message,
+            settings=settings,
+            session_factory=session_factory,
             group_id=group_id,
             user_id=user_id,
             message_text=message_text,
@@ -509,7 +608,6 @@ async def _screen_message_for_flood(
             username=username,
             group_title=group_title,
             verdict=verdict,
-            settings=settings,
         )
         log.info("[%s]【结束】刷屏广告拦截 | user=%s | 强信号", group_id, user_id)
         return True
@@ -7082,6 +7180,7 @@ async def on_group_message(
                 session=session,
                 message=message,
                 settings=settings,
+                session_factory=session_factory,
                 group_id=group_id,
                 user_id=user_id,
                 message_text=str(moderation_input),
