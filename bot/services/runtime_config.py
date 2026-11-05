@@ -348,6 +348,23 @@ class ModerationSettingsConfig(StrictModel):
     challenge_timeout_seconds: int = Field(default=600, ge=60, le=86400)
     bot_screening_enabled: bool = True
     bot_screening_message_count: int = Field(default=5, ge=1, le=100)
+    # 违规消息触发审核动作时，是否私发通知群管理员（含发送人、消息、触发规则）。
+    notify_admin_on_violation: bool = False
+    # 刷屏广告识别：群规未命中时，按频率+相似度+链接聚合判定重复广告。
+    spam_flood_enabled: bool = False
+    spam_flood_window_seconds: int = Field(default=300, ge=30, le=86400)
+    spam_flood_min_messages: int = Field(default=4, ge=2, le=100)
+    spam_flood_similarity_min_hits: int = Field(default=3, ge=2, le=100)
+    spam_flood_similarity_threshold: float = Field(
+        default=0.85, ge=0.5, le=1.0, allow_inf_nan=False
+    )
+    spam_flood_strong_score: float = Field(
+        default=0.85, ge=0.5, le=1.0, allow_inf_nan=False
+    )
+    spam_flood_weak_score: float = Field(
+        default=0.5, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    spam_flood_notify_admin: bool = True
 
 
 class PatrolSettingsConfig(StrictModel):

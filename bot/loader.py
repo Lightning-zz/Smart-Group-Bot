@@ -25,6 +25,9 @@ def create_bot(settings: Settings) -> Bot:
     )
     return Bot(
         token=settings.bot.token,
-        session=PriorityAiohttpSession(timeout=_TELEGRAM_HTTP_TIMEOUT_SECONDS),
+        session=PriorityAiohttpSession(
+            timeout=_TELEGRAM_HTTP_TIMEOUT_SECONDS,
+            proxy=getattr(settings, "telegram_proxy_url", "") or None,
+        ),
         default=default,
     )

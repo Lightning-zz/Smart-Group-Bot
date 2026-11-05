@@ -265,6 +265,7 @@ class ModerationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
                         message=message,
                         notice="blocked",
                         auto_delete_seconds=0,
+                        settings=_notice_settings(),
                     )
 
             async with self.session_factory() as session:
@@ -275,6 +276,7 @@ class ModerationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
                     message=message,
                     notice="blocked",
                     auto_delete_seconds=0,
+                    settings=_notice_settings(),
                 )
                 self.assertTrue(sent)
 
@@ -286,6 +288,7 @@ class ModerationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
                     message=message,
                     notice="blocked",
                     auto_delete_seconds=0,
+                    settings=_notice_settings(),
                 )
                 self.assertFalse(sent)
 
@@ -293,6 +296,12 @@ class ModerationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             violation = await session.get(Violation, violation_id)
             self.assertIsNotNone(violation.notice_sent_at)
+
+
+def _notice_settings():
+    return SimpleNamespace(
+        moderation=SimpleNamespace(notify_admin_on_violation=False)
+    )
 
 
 if __name__ == "__main__":

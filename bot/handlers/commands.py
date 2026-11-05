@@ -85,11 +85,6 @@ def _build_start_text() -> str:
         "永久记忆（管理员自然语言维护）\n"
         "内容审核\n"
         "智能闲聊\n\n"
-        "<b>开源信息</b>\n"
-        f"完全开源（{html.escape(PROJECT_LICENSE)}）\n"
-        f"源码仓库：{html.escape(PROJECT_REPOSITORY_URL)}\n"
-        f"开发者：<code>{html.escape(PROJECT_DEVELOPER)}</code>\n"
-        f"联系方式：<code>{html.escape(PROJECT_DEVELOPER_CONTACT)}</code>\n\n"
         "<b>快速开始</b>\n"
         "发送 /help 查看完整命令。"
     )

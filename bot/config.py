@@ -164,6 +164,25 @@ class ModerationConfig(BaseModel):
     # 连续 bot_screening_message_count 条干净后加入白名单不再审核。
     bot_screening_enabled: bool = True
     bot_screening_message_count: int = 5
+    # 违规消息（触发封禁/删除/警告等审核动作）是否私发通知群管理员。
+    notify_admin_on_violation: bool = False
+    # 刷屏广告识别：同一用户短窗口内重复发送相似内容/链接时判定为刷屏。
+    # 群规（关键词/正则/语义）未命中时的补充检测，分档处置。
+    spam_flood_enabled: bool = False
+    # 统计窗口（秒）。
+    spam_flood_window_seconds: int = 300
+    # 窗口内达到该条数才进入候选。
+    spam_flood_min_messages: int = 4
+    # 触发相似度的消息数下限。
+    spam_flood_similarity_min_hits: int = 3
+    # 相似度阈值（0-1，越高越严格）。
+    spam_flood_similarity_threshold: float = 0.85
+    # 强信号阈值：达到后自动处置（删除/封禁）。
+    spam_flood_strong_score: float = 0.85
+    # 弱信号阈值：达到后仅通知管理员人工确认。
+    spam_flood_weak_score: float = 0.5
+    # 弱信号是否私信通知管理员。
+    spam_flood_notify_admin: bool = True
 
 
 class Settings(BaseSettings):
@@ -172,6 +191,10 @@ class Settings(BaseSettings):
     bot_token: str = ""
     super_admin_id: int = 0
     config_master_key: str = ""
+    # Bot API 出口代理。留空表示直连。支持 socks5://、socks5h://、
+    # socks4://、http://、https:// 以及 user:pass@host:port 形式。
+    # 本地/内网代理可写成 socks5://127.0.0.1:1080。
+    telegram_proxy_url: str = ""
     miniapp_public_base_url: str = ""
     miniapp_listen_host: str = ""
     miniapp_listen_port: int = 0

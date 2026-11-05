@@ -125,6 +125,12 @@ from bot.services.bot_screening import (
 from bot.services.keyword_reply import find_keyword_reply, send_keyword_reply
 from bot.services.member_identity import member_display_name
 from bot.services.message_templates import card_field, render_summary_notice
+from bot.services.violation_notice import (
+    build_flood_admin_notice,
+    notify_admins_of_violation,
+)
+from bot.services import spam_flood
+from bot.services.violation_notice import _resolve_group_admin_ids as _resolve_flood_admin_ids
 from bot.services.moderation import ModerationService
 from bot.services.moderation import ModerationVerdict
 from bot.services.moderation_input import build_moderation_input
@@ -345,6 +351,304 @@ async def _refresh_violation_notice_state(
     await refresh(violation, attribute_names=["notice_sent_at"])
 
 
+async def _notify_flood_admins(
+    *,
+    bot: object,
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+    message_text: str,
+    display_name: str,
+    username: str,
+    group_title: str,
+    verdict: spam_flood.FloodVerdict,
+    settings: Settings,
+) -> int:
+    """Private-message group admins about a suspected flood-ad hit.
+
+    Best-effort: never raises.  Gated on ``moderation.spam_flood_notify_admin``.
+    """
+    if not bool(getattr(settings.moderation, "spam_flood_notify_admin", True)):
+        return 0
+    try:
+        admin_ids = await _resolve_flood_admin_ids(bot, session, group_id)
+    except Exception:
+        return 0
+    if not admin_ids:
+        return 0
+    text = build_flood_admin_notice(
+        sender_id=int(user_id),
+        display_name=display_name,
+        username=username,
+        message_text=message_text,
+        tier=verdict.tier,
+        score=verdict.score,
+        message_count=verdict.message_count,
+        similar_count=verdict.similar_count,
+        link_count=verdict.link_count,
+        group_title=group_title,
+    )
+    delivered = 0
+    for admin_id in sorted(set(admin_ids)):
+        try:
+            await bot.send_message(
+                chat_id=int(admin_id),
+                text=text,
+                disable_web_page_preview=True,
+            )
+            delivered += 1
+        except Exception as exc:
+            log.info(
+                "[%s] flood notice send failed | admin=%s error=%s",
+                group_id,
+                admin_id,
+                type(exc).__name__,
+            )
+    return delivered
+
+
+async def _screen_message_for_flood(
+    *,
+    session: AsyncSession,
+    message: Message,
+    settings: Settings,
+    group_id: int,
+    user_id: int,
+    message_text: str,
+    sender_identity: object,
+) -> bool:
+    """Repetition-based flood-ad detection layered over content moderation.
+
+    Runs only after the rule engine has already judged the text clean, so it
+    targets the gap the rules cannot see: a member repeatedly posting similar
+    adverts.  Returns ``True`` when the message was handled (strong tier, e.g.
+    deleted/banned), ``False`` to let the normal pipeline continue.
+
+    Best-effort and fully defensive: any failure logs and returns ``False``.
+    """
+    if not bool(getattr(settings.moderation, "spam_flood_enabled", False)):
+        return False
+
+    try:
+        spam_flood.observe_message(group_id, user_id, message_text)
+        verdict = spam_flood.score_window(
+            group_id,
+            user_id,
+            window_seconds=float(
+                getattr(settings.moderation, "spam_flood_window_seconds", 300)
+            ),
+            min_messages=int(
+                getattr(settings.moderation, "spam_flood_min_messages", 4)
+            ),
+            similarity_min_hits=int(
+                getattr(settings.moderation, "spam_flood_similarity_min_hits", 3)
+            ),
+            similarity_threshold=float(
+                getattr(settings.moderation, "spam_flood_similarity_threshold", 0.85)
+            ),
+            strong_score=float(
+                getattr(settings.moderation, "spam_flood_strong_score", 0.85)
+            ),
+            weak_score=float(
+                getattr(settings.moderation, "spam_flood_weak_score", 0.5)
+            ),
+        )
+    except Exception:
+        log.warning("[%s] flood detection failed | user=%s", group_id, user_id, exc_info=True)
+        return False
+
+    if not verdict.is_candidate:
+        return False
+
+    display_name = str(getattr(sender_identity, "display_name", "") or "")
+    username = str(getattr(sender_identity, "username", "") or "")
+    group_title = str(getattr(message.chat, "title", "") or "")
+
+    log.info(
+        "[%s] flood detected | user=%s tier=%s score=%.2f msgs=%d sim=%d links=%d",
+        group_id,
+        user_id,
+        verdict.tier,
+        verdict.score,
+        verdict.message_count,
+        verdict.similar_count,
+        verdict.link_count,
+    )
+
+    if verdict.is_strong:
+        # Strong evidence: delete the current message and record a violation so
+        # the existing warn/ban ledger and admin notices stay consistent.
+        async with _moderation_user_lock(group_id, user_id):
+            try:
+                await _persist_flood_violation(
+                    session,
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_text=message_text,
+                )
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                log.warning("[%s] flood violation persist failed | user=%s", group_id, user_id, exc_info=True)
+            try:
+                await message.delete()
+            except Exception as exc:
+                log.warning(
+                    "[%s] flood delete failed | user=%s error=%s",
+                    group_id,
+                    user_id,
+                    type(exc).__name__,
+                )
+        await _notify_flood_admins(
+            bot=message.bot,
+            session=session,
+            group_id=group_id,
+            user_id=user_id,
+            message_text=message_text,
+            display_name=display_name,
+            username=username,
+            group_title=group_title,
+            verdict=verdict,
+            settings=settings,
+        )
+        log.info("[%s]【结束】刷屏广告拦截 | user=%s | 强信号", group_id, user_id)
+        return True
+
+    # Weak evidence: never auto-act; surface to admins for human review.
+    await _notify_flood_admins(
+        bot=message.bot,
+        session=session,
+        group_id=group_id,
+        user_id=user_id,
+        message_text=message_text,
+        display_name=display_name,
+        username=username,
+        group_title=group_title,
+        verdict=verdict,
+        settings=settings,
+    )
+    return False
+
+
+async def _persist_flood_violation(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+    message_text: str,
+) -> object:
+    """Persist a flood hit as a Violation row (rule_id NULL, action flood_delete)."""
+    from bot.db.models import Violation as _Violation
+
+    violation = _Violation(
+        group_id=int(group_id),
+        user_id=int(user_id),
+        rule_id=None,
+        message_text=str(message_text or "")[:500],
+        action_taken="flood_delete",
+    )
+    session.add(violation)
+    await session.flush()
+    return violation
+
+
+async def _notify_admins_of_violation(
+    *,
+    session: AsyncSession,
+    violation: Violation,
+    message: Message,
+    settings: Settings,
+) -> None:
+    """Private-message group admins about one recorded violation.
+
+    Best-effort: any failure is logged and swallowed so the moderation pipeline
+    is never affected.  Gated on ``moderation.notify_admin_on_violation`` and
+    called only from the single notice funnel, so a violation is announced once.
+    """
+
+    if not bool(getattr(settings.moderation, "notify_admin_on_violation", False)):
+        return
+
+    bot = getattr(message, "bot", None)
+    if bot is None:
+        return
+
+    chat = getattr(message, "chat", None)
+    group_id = int(
+        getattr(violation, "group_id", 0) or getattr(chat, "id", 0) or 0
+    )
+    if group_id == 0:
+        return
+    user_id = int(getattr(violation, "user_id", 0) or 0)
+
+    from_user = getattr(message, "from_user", None)
+    sender_chat = getattr(message, "sender_chat", None)
+    if from_user is not None and not _uses_sender_chat_identity(message):
+        display_name = str(getattr(from_user, "full_name", "") or "")
+        username = str(getattr(from_user, "username", "") or "")
+    elif sender_chat is not None:
+        display_name = str(getattr(sender_chat, "title", "") or "")
+        username = str(getattr(sender_chat, "username", "") or "")
+        if not user_id:
+            user_id = int(getattr(sender_chat, "id", 0) or 0)
+    else:
+        display_name = ""
+        username = ""
+
+    if not display_name and not username and user_id:
+        # Fall back to the local roster for synthetic/edited messages.
+        try:
+            from bot.services.violation_notice import lookup_sender_identity
+
+            display_name, username = await lookup_sender_identity(
+                session, group_id, user_id
+            )
+        except Exception:
+            pass
+
+    message_text = str(
+        getattr(violation, "message_text", "")
+        or getattr(message, "text", None)
+        or getattr(message, "caption", None)
+        or ""
+    )
+
+    # Resolve the rule object for the notice; violation only stores rule_id.
+    rule: object | None = None
+    rule_id = getattr(violation, "rule_id", None)
+    if rule_id:
+        try:
+            from bot.db.models import ModerationRule
+
+            rule = await session.scalar(
+                select(ModerationRule).where(ModerationRule.id == int(rule_id))
+            )
+        except Exception:
+            rule = None
+
+    group_title = str(getattr(chat, "title", "") or "")
+    try:
+        await notify_admins_of_violation(
+            bot,
+            session,
+            group_id=group_id,
+            sender_id=user_id,
+            message_text=message_text,
+            rule=rule,
+            action_taken=str(getattr(violation, "action_taken", "") or ""),
+            display_name=display_name,
+            username=username,
+            group_title=group_title,
+        )
+    except Exception:
+        log.warning(
+            "[%s] violation admin notice failed | user=%s",
+            group_id,
+            user_id,
+            exc_info=True,
+        )
+
+
 async def _send_moderation_notice_once_locked(
     *,
     session: AsyncSession,
@@ -352,6 +656,7 @@ async def _send_moderation_notice_once_locked(
     message: Message,
     notice: str,
     auto_delete_seconds: int,
+    settings: Settings,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> bool:
     """Send and durably acknowledge one moderation notice.
@@ -383,6 +688,15 @@ async def _send_moderation_notice_once_locked(
     )
     violation.notice_sent_at = now_shanghai_naive()
     await session.commit()
+    # Announce the violation privately to the group's human administrators.
+    # Reuses the just-committed ``notice_sent_at`` claim so durable retries that
+    # skip the group notice also skip the admin push. Best-effort by design.
+    await _notify_admins_of_violation(
+        session=session,
+        violation=violation,
+        message=message,
+        settings=settings,
+    )
     return True
 
 
@@ -1313,6 +1627,7 @@ async def _screen_bot_sender_message(
                 violation=violation,
                 message=message,
                 notice=notice,
+                settings=settings,
                 auto_delete_seconds=configured_auto_delete_seconds(
                     settings,
                     "moderation",
@@ -1373,6 +1688,7 @@ async def _screen_bot_sender_message(
                 violation=violation,
                 message=message,
                 notice=notice,
+                settings=settings,
                 auto_delete_seconds=configured_auto_delete_seconds(
                     settings,
                     "moderation",
@@ -1426,6 +1742,7 @@ async def _screen_bot_sender_message(
             violation=violation,
             message=message,
             notice=notice,
+            settings=settings,
             auto_delete_seconds=configured_auto_delete_seconds(
                 settings,
                 "moderation",
@@ -6575,6 +6892,7 @@ async def on_group_message(
                             violation=violation,
                             message=message,
                             notice=notice,
+                            settings=settings,
                             auto_delete_seconds=configured_auto_delete_seconds(
                                 settings,
                                 "moderation",
@@ -6616,6 +6934,7 @@ async def on_group_message(
                             violation=violation,
                             message=message,
                             notice=notice,
+                            settings=settings,
                             auto_delete_seconds=configured_auto_delete_seconds(
                                 settings,
                                 "moderation",
@@ -6674,6 +6993,7 @@ async def on_group_message(
                             violation=violation,
                             message=message,
                             notice=notice,
+                            settings=settings,
                             auto_delete_seconds=configured_auto_delete_seconds(
                                 settings,
                                 "moderation",
@@ -6724,6 +7044,7 @@ async def on_group_message(
                         violation=violation,
                         message=message,
                         notice=notice,
+                        settings=settings,
                         auto_delete_seconds=configured_auto_delete_seconds(
                             settings,
                             "moderation",
@@ -6743,6 +7064,38 @@ async def on_group_message(
                 return
     else:
         log.info("[%s]【流程】审核 | 关闭", group_id)
+
+    # Repetition-based flood-ad layer: only for real, non-exempt members whose
+    # text the rule engine judged clean. Strong hits are handled here (return),
+    # weak hits merely alert admins and fall through to the normal pipeline.
+    if (
+        not _edited
+        and not sender_identity.is_chat
+        and not sender_is_owner
+        and not sender_is_tg_admin
+        and (msg_type == "text" or "caption" in msg_type)
+        and getattr(settings.moderation, "spam_flood_enabled", False)
+        and moderation_input
+    ):
+        try:
+            if await _screen_message_for_flood(
+                session=session,
+                message=message,
+                settings=settings,
+                group_id=group_id,
+                user_id=user_id,
+                message_text=str(moderation_input),
+                sender_identity=sender_identity,
+            ):
+                return
+        except Exception:
+            await session.rollback()
+            log.warning(
+                "[%s] flood screening raised; continuing | user=%s",
+                group_id,
+                user_id,
+                exc_info=True,
+            )
 
     if _edited or _moderation_only:
         log.info("[%s] moderation-only review finished | message=%s", group_id, message.message_id)

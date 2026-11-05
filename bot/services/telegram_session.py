@@ -47,11 +47,28 @@ _LIVE_SESSIONS: weakref.WeakSet[PriorityAiohttpSession] = weakref.WeakSet()
 class PriorityAiohttpSession(AiohttpSession):
     """Aiohttp session with reserved capacity and connector self-healing."""
 
-    def __init__(self, *, timeout: float, limit: int = TELEGRAM_TOTAL_CAPACITY) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float,
+        limit: int = TELEGRAM_TOTAL_CAPACITY,
+        proxy: str | None = None,
+    ) -> None:
         total = max(8, int(limit))
         noncritical = max(4, total - min(4, total // 4))
         normal = max(2, noncritical - min(16, max(2, total // 4)))
-        super().__init__(timeout=timeout, limit=total)
+        # aiogram routes proxied traffic through a (Chain)ProxyConnector built
+        # from this URL; None keeps the default direct TCPConnector.
+        proxy_url = str(proxy or "").strip() or None
+        try:
+            super().__init__(timeout=timeout, limit=total, proxy=proxy_url)
+        except RuntimeError as exc:
+            # aiohttp-socks is only required when a SOCKS proxy is configured.
+            raise RuntimeError(
+                f"Invalid TELEGRAM_PROXY_URL={proxy_url!r} or aiohttp-socks missing: {exc}"
+            ) from exc
+        if proxy_url is not None:
+            log.info("Telegram bot API traffic routed through proxy %s", _redact_proxy(proxy_url))
         self._capacity_gate = ReservedCapacityGate(
             total_capacity=total,
             noncritical_capacity=noncritical,
@@ -207,6 +224,24 @@ class PriorityAiohttpSession(AiohttpSession):
                 else None
             ),
         }
+
+
+def _redact_proxy(proxy_url: str) -> str:
+    """Hide embedded proxy credentials before logging the URL."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(proxy_url)
+    except ValueError:
+        return "<invalid>"
+    if not parts.scheme or not parts.hostname:
+        return "<invalid>"
+    netloc = parts.hostname
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    if parts.username:
+        netloc = f"***@{netloc}"
+    return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
 def telegram_session_health_snapshot() -> dict[str, Any]:

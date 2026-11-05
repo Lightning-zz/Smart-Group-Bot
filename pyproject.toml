@@ -23,6 +23,9 @@ dependencies = [
     # for plain SDK usage with tools or the Responses API.
     "fastapi>=0.110",
     "orjson>=3.9",
+    # Optional SOCKS support for TELEGRAM_PROXY_URL (socks4/socks5 schemes).
+    # Plain http(s) proxies work without it.
+    "aiohttp-socks>=0.9",
 ]
 
 [build-system]

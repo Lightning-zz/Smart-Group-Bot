@@ -1343,29 +1343,29 @@ def build_group_prompt_keyboard(user_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="开始验证",
+                    text="👉 开始验证",
                     callback_data=build_verification_callback_data(
                         VERIFICATION_CALLBACK_START,
                         user_id,
                     ),
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    text="管理员通过",
-                    callback_data=build_verification_callback_data(
-                        VERIFICATION_CALLBACK_APPROVE,
-                        user_id,
-                    ),
-                ),
-                InlineKeyboardButton(
-                    text="管理员拒绝",
-                    callback_data=build_verification_callback_data(
-                        VERIFICATION_CALLBACK_REJECT,
-                        user_id,
-                    ),
-                ),
-            ],
+            # [
+            #     InlineKeyboardButton(
+            #         text="管理员通过",
+            #         callback_data=build_verification_callback_data(
+            #             VERIFICATION_CALLBACK_APPROVE,
+            #             user_id,
+            #         ),
+            #     ),
+            #     InlineKeyboardButton(
+            #         text="管理员拒绝",
+            #         callback_data=build_verification_callback_data(
+            #             VERIFICATION_CALLBACK_REJECT,
+            #             user_id,
+            #         ),
+            #     ),
+            # ],
         ]
     )
 

@@ -420,6 +420,9 @@ class ModerationNoticeTransactionBoundaryTests(unittest.IsolatedAsyncioTestCase)
                 message=SimpleNamespace(),
                 notice="blocked",
                 auto_delete_seconds=0,
+                settings=SimpleNamespace(
+                    moderation=SimpleNamespace(notify_admin_on_violation=False)
+                ),
             )
 
         self.assertTrue(sent)
