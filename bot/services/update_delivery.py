@@ -117,6 +117,7 @@ _ADMIN_CALLBACK_PREFIXES = (
     "atl:",  # authorized-group pages
     "adl:",  # delegated-admin pages
     "wpl:",  # warning pages
+    "chun:",  # human-challenge admin 解封 button
 )
 _ADMIN_CALLBACK_EXACT = frozenset(
     {

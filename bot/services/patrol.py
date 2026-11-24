@@ -76,6 +76,11 @@ from bot.services.join_verification import (
 )
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
+from bot.services.violation_notice import (
+    challenge_notice_enabled,
+    lookup_group_title,
+    notify_admins_of_challenge_batch,
+)
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -1256,7 +1261,53 @@ class PatrolService:
                 ",".join(str(v.user_id) for v in active_chunk),
                 timeout_seconds,
             )
+            await self._notify_admins_of_patrol_challenge(
+                group_id,
+                active_chunk,
+                timeout_seconds=timeout_seconds,
+            )
         return enforced
+
+    async def _notify_admins_of_patrol_challenge(
+        self,
+        group_id: int,
+        violators: list[PatrolViolator],
+        *,
+        timeout_seconds: int,
+    ) -> None:
+        """Best-effort admin notice for a batch of patrol challenges."""
+        if not violators or not challenge_notice_enabled(self.settings):
+            return
+        try:
+            async with self.session_factory() as session:
+                group_title = await lookup_group_title(session, group_id)
+                # Release the read snapshot before the helper's Telegram sends.
+                await session.commit()
+                await notify_admins_of_challenge_batch(
+                    self.bot,
+                    session,
+                    group_id=int(group_id),
+                    members=[
+                        (
+                            int(v.user_id),
+                            v.full_name or "",
+                            v.username or "",
+                            v.reason or "资料命中群规",
+                        )
+                        for v in violators
+                    ],
+                    group_title=group_title,
+                    timeout_seconds=int(timeout_seconds),
+                    kind=VERIFICATION_KIND_PATROL,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning(
+                "[%s] patrol challenge admin notice failed",
+                group_id,
+                exc_info=True,
+            )
 
     async def _mark_running(self, group_id: int, running: bool) -> None:
         try:

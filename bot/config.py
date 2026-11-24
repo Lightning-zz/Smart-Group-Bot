@@ -166,6 +166,8 @@ class ModerationConfig(BaseModel):
     bot_screening_message_count: int = 5
     # 违规消息（触发封禁/删除/警告等审核动作）是否私发通知群管理员。
     notify_admin_on_violation: bool = False
+    # 发起人机审核（质询/验证）时是否私发通知群管理员，附用户 ID 与「解封」按钮。
+    notify_admin_on_challenge: bool = True
     # 刷屏广告识别：同一用户短窗口内重复发送相似内容/链接时判定为刷屏。
     # 群规（关键词/正则/语义）未命中时的补充检测，分档处置。
     spam_flood_enabled: bool = False

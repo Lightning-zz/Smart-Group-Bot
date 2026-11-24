@@ -100,6 +100,7 @@ from bot.services.join_verification import (
     close_private_challenge_message,
     complete_leased_join_verification,
     delete_join_verification,
+    get_join_verification,
     enforce_ban_with_policy_reconciliation_result,
     join_verification_lease_is_current,
     lease_join_verification_for_unban,
@@ -127,6 +128,8 @@ from bot.services.member_identity import member_display_name
 from bot.services.message_templates import card_field, render_summary_notice
 from bot.services.violation_notice import (
     build_flood_admin_notice,
+    challenge_notice_enabled,
+    notify_admins_of_challenge,
     notify_admins_of_violation,
 )
 from bot.services import spam_flood
@@ -500,6 +503,33 @@ async def _handle_strong_flood(
                 challenged = False
         if challenged:
             log.info("[%s] flood challenge issued | user=%s", group_id, user_id)
+            try:
+                if challenge_notice_enabled(settings):
+                    # The challenge is already durable; release the read
+                    # snapshot before the notice's Telegram calls.
+                    await session.commit()
+                    await notify_admins_of_challenge(
+                        message.bot,
+                        session,
+                        group_id=group_id,
+                        sender_id=user_id,
+                        message_text=message_text,
+                        reason=verdict.reason or "疑似刷屏广告",
+                        display_name=display_name,
+                        username=username,
+                        group_title=group_title,
+                        timeout_seconds=int(
+                            getattr(settings.moderation, "challenge_timeout_seconds", 600)
+                        ),
+                        kind="moderation",
+                    )
+            except Exception:
+                log.warning(
+                    "[%s] challenge admin notice failed | user=%s",
+                    group_id,
+                    user_id,
+                    exc_info=True,
+                )
         else:
             # No challenge transport: ban immediately to stop the flood.
             try:
@@ -3041,6 +3071,245 @@ async def _delete_callback_message(callback: CallbackQuery) -> bool:
         return True
     except Exception:
         return False
+
+
+_CHALLENGE_UNBAN_CALLBACK_PREFIX = "chun"
+
+
+def _parse_challenge_unban_callback(data: str) -> tuple[int, int] | None:
+    parts = str(data or "").split(":")
+    if len(parts) != 4 or parts[0] != _CHALLENGE_UNBAN_CALLBACK_PREFIX:
+        return None
+    if parts[1] != "unban":
+        return None
+    try:
+        group_id = int(parts[2])
+        user_id = int(parts[3])
+    except (TypeError, ValueError):
+        return None
+    if group_id == 0 or user_id <= 0:
+        return None
+    return group_id, user_id
+
+
+async def _release_challenge_restriction(
+    *,
+    bot: Any,
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+) -> str:
+    """Release a member's active challenge restriction and clear the record.
+
+    Returns a short outcome string for the operator.  Reuses the same durable
+    unban journal the moderation "误封解除" path uses so a crash mid-release is
+    completed by the background sweeper instead of leaving the member muted.
+    """
+    if await is_globally_banned(session, user_id):
+        await session.commit()
+        return "该用户已处于全局封禁，需由最高管理员处理"
+    record = await get_join_verification(session, group_id, user_id)
+    if record is None:
+        await session.commit()
+        return "该用户没有进行中的质询"
+    prompt_message_id = int(getattr(record, "prompt_message_id", 0) or 0)
+    private_message_id = int(getattr(record, "private_message_id", 0) or 0)
+    recovery = await lease_join_verification_for_unban(
+        session,
+        group_id,
+        user_id,
+        manual_unban=True,
+    )
+    if recovery is None:
+        await session.rollback()
+        return "无法建立解封工单，请稍后重试"
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        log.exception(
+            "challenge unban persistence failed | group=%s user=%s", group_id, user_id
+        )
+        return "解封状态保存失败，请稍后重试"
+
+    activate_manual_unban_recovery(recovery)
+    released = await release_moderation_restriction_after_exemption(
+        bot,
+        session,
+        recovery,
+    )
+    if not released:
+        return "解封已交由后台继续重试"
+    try:
+        await delete_join_verification(session, group_id, user_id)
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        log.debug("challenge record cleanup failed | group=%s user=%s", group_id, user_id)
+    # Retire the now-meaningless challenge surfaces: the group prompt keyboard
+    # and the member's private challenge entry. Both are best-effort.
+    if prompt_message_id:
+        try:
+            from bot.services.join_verification import delete_verification_prompt
+
+            await delete_verification_prompt(bot, group_id, prompt_message_id)
+        except Exception:
+            log.debug(
+                "challenge prompt cleanup failed | group=%s user=%s",
+                group_id,
+                user_id,
+                exc_info=True,
+            )
+    if private_message_id:
+        try:
+            await close_private_challenge_message(
+                bot,
+                user_id,
+                private_message_id,
+            )
+        except Exception:
+            log.debug(
+                "private challenge cleanup failed | group=%s user=%s",
+                group_id,
+                user_id,
+                exc_info=True,
+            )
+    return "已解除该用户的质询限制并恢复发言权限"
+
+
+@router.callback_query(F.data.startswith(f"{_CHALLENGE_UNBAN_CALLBACK_PREFIX}:"))
+async def on_challenge_unban(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
+    """Admin '解封' button attached to human-challenge notices.
+
+    Callback data is attacker-controlled, so authorization is re-checked here
+    (and again inside the privileged task) before any Telegram mutation.
+    """
+    parsed = _parse_challenge_unban_callback(callback.data or "")
+    if parsed is None:
+        await callback.answer("参数无效", show_alert=True)
+        return
+    group_id, target_id = parsed
+    operator = callback.from_user
+    if session is None or operator is None:
+        await callback.answer("会话未就绪，请稍后重试", show_alert=True)
+        return
+
+    if not await is_group_authorized(session, group_id):
+        await session.commit()
+        await callback.answer("当前群组未授权，不能解封", show_alert=True)
+        return
+    await session.commit()
+    if not await is_group_admin_or_higher(
+        bot=callback.bot,
+        session=session,
+        settings=settings,
+        group_id=group_id,
+        user_id=int(operator.id),
+    ):
+        await callback.answer("仅群管理员及以上权限可解封", show_alert=True)
+        return
+    in_transaction = getattr(session, "in_transaction", None)
+    if callable(in_transaction) and in_transaction():
+        await session.commit()
+
+    callback_acknowledged = asyncio.Event()
+
+    async def operation() -> None:
+        # The keyboard edit is applied to the original notice; a detached proxy
+        # is unnecessary because the pressed button is removed in place.
+        await callback_acknowledged.wait()
+        async with session_factory() as work_session:
+            outcome = await _release_challenge_restriction(
+                bot=callback.bot,
+                session=work_session,
+                group_id=group_id,
+                user_id=target_id,
+            )
+            await work_session.commit()
+        await _finish_challenge_unban_notice(callback, outcome)
+
+    if session_factory is None:
+        outcome = await _release_challenge_restriction(
+            bot=callback.bot,
+            session=session,
+            group_id=group_id,
+            user_id=target_id,
+        )
+        await callback.answer(outcome, show_alert=True)
+        return
+
+    submission = submit_privileged_task(
+        key=f"challenge-unban:{group_id}:{target_id}",
+        label=f"challenge unban {target_id} in {group_id}",
+        operation=operation,
+        lane="critical",
+        priority=0,
+        timeout_seconds=120.0,
+    )
+    try:
+        if not submission.accepted:
+            request_current_update_retry()
+            await callback.answer("解封任务队列正忙，本次操作会自动重试。", show_alert=True)
+        elif not submission.created:
+            await callback.answer("该用户的解封正在执行，未重复提交。", show_alert=True)
+        else:
+            await callback.answer("解封操作已受理，正在后台复验权限并执行")
+    finally:
+        callback_acknowledged.set()
+
+
+def _remove_challenge_unban_button(markup: Any, data: str) -> Any | None:
+    """Drop only the pressed 解封 row, keeping other members' buttons usable.
+
+    A batch notice carries one button per challenged member; pressing one must
+    not disable the rest.  Returns ``None`` when no button remains, so the
+    caller can clear the keyboard entirely.
+    """
+    inline = getattr(markup, "inline_keyboard", None)
+    if not inline:
+        return None
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    remaining: list[list[Any]] = []
+    for row in inline:
+        kept = [button for button in row if getattr(button, "callback_data", None) != data]
+        if kept:
+            remaining.append(kept)
+    if not remaining:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=remaining)
+
+
+async def _finish_challenge_unban_notice(
+    callback: CallbackQuery,
+    outcome: str,
+) -> None:
+    """Retire the pressed 解封 button and report the outcome.
+
+    Batch notices hold several members' buttons; only the pressed one is
+    removed so the remaining 解封 actions stay available.
+    """
+    data = str(getattr(callback, "data", "") or "")
+    markup = getattr(callback.message, "reply_markup", None)
+    remaining = _remove_challenge_unban_button(markup, data) if data else None
+    try:
+        await callback.bot.edit_message_reply_markup(
+            chat_id=int(callback.message.chat.id),
+            message_id=int(callback.message.message_id),
+            reply_markup=remaining,
+        )
+    except Exception:
+        log.debug("challenge unban notice keyboard cleanup failed", exc_info=True)
+    try:
+        if callback.message is not None and hasattr(callback.message, "answer"):
+            await callback.message.answer(f"解封结果：{outcome}")
+    except Exception:
+        log.debug("challenge unban outcome reply failed", exc_info=True)
 
 
 @router.callback_query(F.data.startswith(f"{DELETE_BUTTON_CALLBACK_PREFIX}:"))
@@ -6855,6 +7124,36 @@ async def on_group_message(
                                             now_shanghai_naive()
                                         )
                                         await session.commit()
+                                        try:
+                                            if challenge_notice_enabled(settings):
+                                                await notify_admins_of_challenge(
+                                                    message.bot,
+                                                    session,
+                                                    group_id=group_id,
+                                                    sender_id=user_id,
+                                                    message_text=str(moderation_input),
+                                                    reason=reason,
+                                                    display_name=display_name,
+                                                    username=sender_identity.username,
+                                                    group_title=str(
+                                                        getattr(message.chat, "title", "") or ""
+                                                    ),
+                                                    timeout_seconds=int(
+                                                        getattr(
+                                                            settings.moderation,
+                                                            "challenge_timeout_seconds",
+                                                            600,
+                                                        )
+                                                    ),
+                                                    kind="moderation",
+                                                )
+                                        except Exception:
+                                            log.warning(
+                                                "[%s] challenge admin notice failed | user=%s",
+                                                group_id,
+                                                user_id,
+                                                exc_info=True,
+                                            )
                                     else:
                                         # The challenge was not created, so this
                                         # provisional event must not monopolize the

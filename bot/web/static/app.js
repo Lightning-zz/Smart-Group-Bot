@@ -976,6 +976,7 @@
             ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "guest 模式等 bot 消息先审核，累计干净消息达标后加入白名单")}
             ${field("moderation.bot_screening_message_count", "bot 白名单所需干净消息数", { type: "number", min: 1, max: 100, step: 1, required: true })}
             ${toggle("moderation.notify_admin_on_violation", "违规通知管理员", "违规消息触发审核动作时，私聊通知群管理员（含发送人、消息内容、触发规则）")}
+            ${toggle("moderation.notify_admin_on_challenge", "人机审核通知管理员", "发起人机审核（质询/验证）时私聊通知群管理员，消息带用户 ID 和「解封」按钮")}
           </div>
         </section>
         <section class="settings-section">

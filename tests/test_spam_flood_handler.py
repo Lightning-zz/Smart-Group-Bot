@@ -21,6 +21,8 @@ def _settings(**overrides):
         spam_flood_strong_score=0.85,
         spam_flood_weak_score=0.5,
         spam_flood_notify_admin=True,
+        notify_admin_on_challenge=True,
+        notify_admin_on_violation=False,
     )
     for key, value in overrides.items():
         setattr(moderation, key, value)
@@ -99,9 +101,11 @@ class FloodHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         challenge = AsyncMock(return_value=True)
         ban = AsyncMock(return_value=True)
+        notify = AsyncMock(return_value=1)
         with patch.object(group, "delete_recent_member_messages", new=AsyncMock(return_value=2)), \
              patch.object(group, "moderation_challenge_ready", return_value=True), \
              patch.object(group, "begin_moderation_challenge", new=challenge), \
+             patch.object(group, "notify_admins_of_challenge", new=notify), \
              patch.object(group, "ban_member", new=ban):
             handled = False
             for index in range(4):
@@ -118,6 +122,9 @@ class FloodHandlerTests(unittest.IsolatedAsyncioTestCase):
         challenge.assert_awaited_once()
         self.assertEqual(challenge.await_args.kwargs["rule_action"], "ban")
         ban.assert_not_awaited()
+        notify.assert_awaited_once()
+        self.assertEqual(notify.await_args.kwargs["sender_id"], 7)
+        self.assertEqual(notify.await_args.kwargs["kind"], "moderation")
 
     async def test_weak_hit_notifies_but_does_not_handle(self) -> None:
         bot = SimpleNamespace(

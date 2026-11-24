@@ -350,6 +350,8 @@ class ModerationSettingsConfig(StrictModel):
     bot_screening_message_count: int = Field(default=5, ge=1, le=100)
     # 违规消息触发审核动作时，是否私发通知群管理员（含发送人、消息、触发规则）。
     notify_admin_on_violation: bool = False
+    # 发起人机审核（质询/验证）时是否私发通知群管理员，附用户 ID 与「解封」按钮。
+    notify_admin_on_challenge: bool = True
     # 刷屏广告识别：群规未命中时，按频率+相似度+链接聚合判定重复广告。
     spam_flood_enabled: bool = False
     spam_flood_window_seconds: int = Field(default=300, ge=30, le=86400)

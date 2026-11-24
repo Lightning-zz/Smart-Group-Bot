@@ -54,6 +54,11 @@ from bot.config import Settings
 from bot.db.models import AuthorizedGroup, Group, JoinVerification
 from bot.services.authz import is_group_authorized
 from bot.services.join_screening import is_globally_banned
+from bot.services.violation_notice import (
+    challenge_notice_enabled,
+    lookup_group_title,
+    notify_admins_of_challenge_batch,
+)
 from bot.services.join_verification import (
     RAID_VERIFY_CALLBACK_DATA,
     TERMINAL_LEASE_SECONDS,
@@ -3049,4 +3054,50 @@ class RaidGuardService:
                 ",".join(str(item.user_id) for item in active_chunk),
                 timeout_seconds,
             )
+            await self._notify_admins_of_raid_challenge(
+                group_id,
+                active_chunk,
+                timeout_seconds=timeout_seconds,
+            )
         return enforced
+
+    async def _notify_admins_of_raid_challenge(
+        self,
+        group_id: int,
+        suspects: list[RaidSuspect],
+        *,
+        timeout_seconds: int,
+    ) -> None:
+        """Best-effort admin notice for a batch of raid challenges."""
+        if not suspects or not challenge_notice_enabled(self.settings):
+            return
+        try:
+            async with self.session_factory() as session:
+                group_title = await lookup_group_title(session, group_id)
+                # Release the read snapshot before the helper's Telegram sends.
+                await session.commit()
+                await notify_admins_of_challenge_batch(
+                    self.bot,
+                    session,
+                    group_id=int(group_id),
+                    members=[
+                        (
+                            int(suspect.user_id),
+                            suspect.full_name or "",
+                            suspect.username or "",
+                            "爆破防护：短时间内批量加入",
+                        )
+                        for suspect in suspects
+                    ],
+                    group_title=group_title,
+                    timeout_seconds=int(timeout_seconds),
+                    kind=VERIFICATION_KIND_RAID,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning(
+                "[%s] raid challenge admin notice failed",
+                group_id,
+                exc_info=True,
+            )
